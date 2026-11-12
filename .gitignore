@@ -1,0 +1,19 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.pytest_cache/
+
+# Environment variables & secrets
+.env
+
+# VS Code & IDE settings
+.vscode/
+.idea/
+
+# Streamlit runtime
+.streamlit/
+
