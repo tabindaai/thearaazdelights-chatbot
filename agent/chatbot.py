@@ -14,6 +14,7 @@ import asyncio
 import logging
 from typing import Dict, Any, Tuple, Optional
 from dotenv import load_dotenv
+from agent.mcp_client import call_mcp_tool
 
 from google import genai
 from google.genai import types
@@ -59,13 +60,46 @@ class RestaurantChatbotAgent:
             return error_msg, session.state.value, session.last_confirmed_reservation_id
 
         # 2. Duplicate Booking Safeguard: If already confirmed
+       
+        # 2. Handle messages after a reservation is confirmed
         if (
             session.state == ConversationState.RESERVATION_CONFIRMED
             and session.last_confirmed_reservation_id
         ):
-            if Guardrails.is_affirmative_confirmation(sanitized_text) or any(
-                w in sanitized_text.lower() for w in ["confirm", "booked", "reservation", "status", "again", "yes", "yeah"]
-            ):
+            message = sanitized_text.lower().strip()
+            normalized = message.rstrip("!.,? ")
+
+            # Handle simple acknowledgements naturally
+            acknowledgement_replies = {
+                "okay": "You're very welcome! Is there anything else I can help you with?",
+                "ok": "Of course! Let me know if you need anything else.",
+                "yes": "Absolutely! How else may I assist you?",
+                "yes sure": "Certainly! I'm happy to help.",
+                "sure": "Of course! Is there anything else you'd like assistance with?",
+                "yeah": "Great! Please let me know if you need anything else.",
+                "thanks": "You're most welcome! We look forward to welcoming you.",
+                "thank you": "You're very welcome! Have a wonderful day.",
+                "bye": "Goodbye! We look forward to seeing you at The Araaz Delights.",
+            }
+
+            if normalized in acknowledgement_replies:
+                reply = acknowledgement_replies[normalized]
+                session.add_user_message(sanitized_text)
+                session.add_model_message(reply)
+                return reply, session.state.value, session.last_confirmed_reservation_id
+
+            # Show existing booking details only for explicit status requests
+            status_phrases = [
+                "booking status",
+                "reservation status",
+                "show my reservation",
+                "show my booking",
+                "booking details",
+                "reservation details",
+                "my reservation details",
+            ]
+
+            if any(phrase in message for phrase in status_phrases):
                 already_booked_reply = (
                     f"Your reservation is already confirmed!\n\n"
                     f"**Reservation ID:** `{session.last_confirmed_reservation_id}`\n"
@@ -73,11 +107,12 @@ class RestaurantChatbotAgent:
                     f"**Date:** {session.draft.reservation_date}\n"
                     f"**Time:** {session.draft.reservation_time}\n"
                     f"**Party Size:** {session.draft.guest_count} guests\n"
-                    f"We look forward to welcoming you to The Araaz Delights! Please let us know if you need to cancel or change details."
+                    "Please let me know if you need any further assistance."
                 )
                 session.add_user_message(sanitized_text)
                 session.add_model_message(already_booked_reply)
                 return already_booked_reply, session.state.value, session.last_confirmed_reservation_id
+
 
         # 3. Context-Aware Deterministic Confirmation Handling in Python
         tools_instance = AgentTools(session)
@@ -162,18 +197,49 @@ class RestaurantChatbotAgent:
                 confirmed_by_customer=confirmed_by_customer if confirmed_by_customer else None,
             )
 
+        
         def check_table_availability(
             reservation_date: str,
             reservation_time: str,
             guest_count: int,
         ) -> Dict[str, Any]:
-            """Check if tables are available for the requested date, time, and guest count."""
+            """Check table availability through the Araaz Delights MCP server."""
+
+            # Preserve the existing duplicate-check cache.
+            current_params = {
+                "date": reservation_date,
+                "time": reservation_time,
+                "guest_count": guest_count,
+            }
+
+            if (
+                tools_instance.session.last_checked_params == current_params
+                and tools_instance.session.last_availability_result is not None
+            ):
+                return tools_instance.session.last_availability_result
+            
+            print(">>> Calling MCP availability tool...")
+            # Execute the availability tool through MCP.
+            mcp_result = call_mcp_tool(
+                "check_table_availability",
+                {
+                   "reservation_date": reservation_date,
+                   "reservation_time": reservation_time,
+                   "guest_count": guest_count,
+                },
+            )
+            print(">>> MCP result:", mcp_result)
+            
+
+            # Let AgentTools update the session and booking state.
             return tools_instance.check_table_availability(
                 reservation_date=reservation_date,
                 reservation_time=reservation_time,
                 guest_count=guest_count,
+                mcp_result=mcp_result,
             )
-
+           
+            
         def find_alternative_slots(
             reservation_date: str,
             requested_time: str,

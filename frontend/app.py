@@ -9,11 +9,23 @@ Does NOT store Gemini keys or call database APIs directly.
 import uuid
 import requests
 import streamlit as st
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 FASTAPI_URL = "http://127.0.0.1:8000"
+
+def get_greeting():
+    current_hour = datetime.now(ZoneInfo("Asia/Kolkata")).hour
+
+    if current_hour < 12:
+        return "Good morning!"
+    elif current_hour < 17:
+        return "Good afternoon!"
+    else:
+        return "Good evening!"
 
 st.set_page_config(
     page_title="The Araaz Delights - AI Concierge",
@@ -66,8 +78,7 @@ if "messages" not in st.session_state:
     st.session_state.messages = [
         {
             "role": "assistant",
-            "content": "Good evening! Welcome to **The Araaz Delights**. I am Aria, your AI Reservation Concierge. How may I assist you with your table booking today?"
-        }
+"content": f"{get_greeting()} Welcome to **The Araaz Delights**. I am Aria, your AI Reservation Concierge. How may I assist you with your table booking today?"        }
     ]
 
 if "current_state" not in st.session_state:
@@ -134,8 +145,7 @@ def reset_conversation():
     st.session_state.messages = [
         {
             "role": "assistant",
-            "content": "Good evening! Welcome to **The Araaz Delights**. I am Aria, your AI Reservation Concierge. How may I assist you with your table booking today?"
-        }
+"content": f"{get_greeting()} Welcome to **The Araaz Delights**. I am Aria, your AI Reservation Concierge. How may I assist you with your table booking today?"        }
     ]
 
 
