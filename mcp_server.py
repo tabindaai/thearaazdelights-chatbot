@@ -12,8 +12,11 @@ from schemas.reservation import (
 )
 from services.restaurant_api import restaurant_api
 
-mcp = FastMCP("Araaz Delights Reservation Server")
-
+mcp = FastMCP(
+    "Araaz Delights Reservation Server",
+    host="0.0.0.0",
+    port=8001,
+)
 
 @mcp.tool()
 def test_connection() -> str:
@@ -131,5 +134,51 @@ def find_alternative_slots(
         ]
     }
 
+@mcp.tool()
+def update_reservation(
+    reservation_id: str,
+    reservation_date: str = "",
+    reservation_time: str = "",
+    guest_count: int = 0,
+    seating_preference: str = "",
+    special_requests: str = "",
+) -> dict:
+    """
+    Update an existing confirmed restaurant reservation.
+
+    Args:
+        reservation_id: Confirmed reservation code (e.g. RES-12345).
+        reservation_date: Optional new date in YYYY-MM-DD format.
+        reservation_time: Optional new time in HH:MM format.
+        guest_count: Optional new party size.
+        seating_preference: Optional seating preference (indoor, outdoor, any).
+        special_requests: Optional special requests or notes.
+    """
+    details = restaurant_api.update_reservation(
+        reservation_id=reservation_id,
+        reservation_date=reservation_date or None,
+        reservation_time=reservation_time or None,
+        guest_count=guest_count if guest_count > 0 else None,
+        seating_preference=seating_preference or None,
+        special_requests=special_requests or None,
+    )
+
+    if details:
+        return {
+            "updated": True,
+            "reservation_id": reservation_id,
+            "details": details.model_dump(),
+            "message": f"Reservation {reservation_id} updated successfully.",
+        }
+
+    return {
+        "updated": False,
+        "reservation_id": reservation_id,
+        "message": f"Could not find or update reservation with ID {reservation_id}.",
+    }
+
+
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    mcp.run(
+        transport="streamable-http"
+    )

@@ -10,6 +10,7 @@ Integrates:
 """
 
 import os
+import re
 import asyncio
 import logging
 from typing import Dict, Any, Tuple, Optional
@@ -58,6 +59,8 @@ class RestaurantChatbotAgent:
 
         if not is_valid:
             return error_msg, session.state.value, session.last_confirmed_reservation_id
+       
+        
 
         # 2. Duplicate Booking Safeguard: If already confirmed
        
@@ -69,24 +72,6 @@ class RestaurantChatbotAgent:
             message = sanitized_text.lower().strip()
             normalized = message.rstrip("!.,? ")
 
-            # Handle simple acknowledgements naturally
-            acknowledgement_replies = {
-                "okay": "You're very welcome! Is there anything else I can help you with?",
-                "ok": "Of course! Let me know if you need anything else.",
-                "yes": "Absolutely! How else may I assist you?",
-                "yes sure": "Certainly! I'm happy to help.",
-                "sure": "Of course! Is there anything else you'd like assistance with?",
-                "yeah": "Great! Please let me know if you need anything else.",
-                "thanks": "You're most welcome! We look forward to welcoming you.",
-                "thank you": "You're very welcome! Have a wonderful day.",
-                "bye": "Goodbye! We look forward to seeing you at The Araaz Delights.",
-            }
-
-            if normalized in acknowledgement_replies:
-                reply = acknowledgement_replies[normalized]
-                session.add_user_message(sanitized_text)
-                session.add_model_message(reply)
-                return reply, session.state.value, session.last_confirmed_reservation_id
 
             # Show existing booking details only for explicit status requests
             status_phrases = [
@@ -158,10 +143,52 @@ class RestaurantChatbotAgent:
                 session.add_model_message(error_reply)
                 return error_reply, session.state.value, None
 
-        # 4. Update Session History with user message
+        
+        # 3. Topic relevance guardrail: Enforce reservation-only scope across all stages
+        if Guardrails.is_off_topic(sanitized_text, session):
+            logger.info(f"Off-topic message detected for session '{session_id}': '{sanitized_text[:50]}'")
+            return (
+                Guardrails.off_topic_response(),
+                session.state.value,
+                session.last_confirmed_reservation_id
+            )
+
+        # 4. Context-aware customer name extraction if the assistant requested customer's name
+        if not session.draft.customer_name and session.state in (
+            ConversationState.SLOT_AVAILABLE,
+            ConversationState.COLLECTING_DETAILS,
+        ):
+            clean = sanitized_text.strip()
+            name_match = re.match(
+                r"^(?:my name is|i am|i'm|this is|it's|name is)?\s*([a-zA-Z][a-zA-Z\s.'-]{1,40})$",
+                clean,
+                re.IGNORECASE,
+            )
+            if name_match:
+                candidate_name = name_match.group(1).strip()
+                disqualified = {
+                    "hello", "hi", "hey", "hii", "namaste", "bye", "goodbye",
+                    "yes", "yeah", "yep", "no", "nope", "okay", "ok", "sure",
+                    "table", "reservation", "booking", "tomorrow", "today", "tonight",
+                    "thanks", "thank you", "alright", "fine"
+                }
+                words = candidate_name.lower().split()
+                if not any(w in disqualified for w in words) and len(words) <= 4:
+                    last_bot_msg = ""
+                    for m in reversed(session.history):
+                        if m.get("role") == "model":
+                            last_bot_msg = m["parts"][0]["text"].lower()
+                            break
+                    if "name" in last_bot_msg or session.state == ConversationState.SLOT_AVAILABLE:
+                        logger.info(f"Auto-extracted customer name '{candidate_name.title()}' for session '{session_id}'")
+                        session.draft.customer_name = candidate_name.title()
+                        if session.draft.has_required_booking_fields() and session.draft.hold_token:
+                            session.set_state(ConversationState.AWAITING_CUSTOMER_CONFIRMATION)
+
+        # 5. Update Session History with user message
         session.add_user_message(sanitized_text)
 
-        # 5. Check for API key configuration
+        # 6. Check for API key configuration
         client = self._get_genai_client()
         if not client:
             fallback_reply = (
@@ -171,7 +198,7 @@ class RestaurantChatbotAgent:
             session.add_model_message(fallback_reply)
             return fallback_reply, session.state.value, session.last_confirmed_reservation_id
 
-        # 6. Bind Tools to this specific session
+        # 7. Bind Tools to this specific session
         tools_instance = AgentTools(session)
 
         # Synchronous wrapper functions for Gemini tool calling
@@ -184,8 +211,9 @@ class RestaurantChatbotAgent:
             guest_count: int = 0,
             special_requests: str = "",
             confirmed_by_customer: bool = False,
+            seating_preference: str = "",
         ) -> Dict[str, Any]:
-            """Record customer details or explicit confirmation extracted from conversation."""
+            """Record customer details, seating preferences, or explicit confirmation extracted from conversation."""
             return tools_instance.update_reservation_details(
                 name=name or None,
                 phone=phone or None,
@@ -195,48 +223,19 @@ class RestaurantChatbotAgent:
                 guest_count=guest_count if guest_count > 0 else None,
                 special_requests=special_requests or None,
                 confirmed_by_customer=confirmed_by_customer if confirmed_by_customer else None,
+                seating_preference=seating_preference or None,
             )
 
-        
         def check_table_availability(
             reservation_date: str,
             reservation_time: str,
             guest_count: int,
         ) -> Dict[str, Any]:
             """Check table availability through the Araaz Delights MCP server."""
-
-            # Preserve the existing duplicate-check cache.
-            current_params = {
-                "date": reservation_date,
-                "time": reservation_time,
-                "guest_count": guest_count,
-            }
-
-            if (
-                tools_instance.session.last_checked_params == current_params
-                and tools_instance.session.last_availability_result is not None
-            ):
-                return tools_instance.session.last_availability_result
-            
-            print(">>> Calling MCP availability tool...")
-            # Execute the availability tool through MCP.
-            mcp_result = call_mcp_tool(
-                "check_table_availability",
-                {
-                   "reservation_date": reservation_date,
-                   "reservation_time": reservation_time,
-                   "guest_count": guest_count,
-                },
-            )
-            print(">>> MCP result:", mcp_result)
-            
-
-            # Let AgentTools update the session and booking state.
             return tools_instance.check_table_availability(
                 reservation_date=reservation_date,
                 reservation_time=reservation_time,
                 guest_count=guest_count,
-                mcp_result=mcp_result,
             )
            
             
@@ -272,6 +271,24 @@ class RestaurantChatbotAgent:
             """Cancel an active reservation by its reservation code."""
             return tools_instance.cancel_existing_reservation(reservation_id)
 
+        def update_confirmed_reservation(
+            reservation_id: str,
+            reservation_date: str = "",
+            reservation_time: str = "",
+            guest_count: int = 0,
+            seating_preference: str = "",
+            special_requests: str = "",
+        ) -> Dict[str, Any]:
+            """Update an existing confirmed reservation's date, time, party size, or seating."""
+            return tools_instance.update_confirmed_reservation(
+                reservation_id=reservation_id,
+                reservation_date=reservation_date or None,
+                reservation_time=reservation_time or None,
+                guest_count=guest_count if guest_count > 0 else None,
+                seating_preference=seating_preference or None,
+                special_requests=special_requests or None,
+            )
+
         # 5. Build Dynamic System Prompt with current runtime state
         system_instruction = build_system_prompt(session)
 
@@ -284,6 +301,7 @@ class RestaurantChatbotAgent:
                 create_reservation,
                 get_reservation_details,
                 cancel_existing_reservation,
+                update_confirmed_reservation,
             ]
 
             # Build message history for Gemini SDK

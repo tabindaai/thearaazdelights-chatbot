@@ -11,7 +11,6 @@ from agent.memory import SessionMemory, ConversationState
 from agent.guardrails import Guardrails
 from agent.mcp_client import call_mcp_tool
 from schemas.reservation import (
-    AvailabilityRequest,
     AvailabilityResponse,
     ReservationCreateRequest,
     ReservationResponse,
@@ -35,6 +34,7 @@ class AgentTools:
         guest_count: Optional[int] = None,
         special_requests: Optional[str] = None,
         confirmed_by_customer: Optional[bool] = None,
+        seating_preference: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Record or update customer information and reservation preferences extracted from conversation.
@@ -62,9 +62,19 @@ class AgentTools:
             draft.update_field("guest_count", guest_count)
         if special_requests:
             draft.update_field("special_requests", special_requests.strip())
+        
         if confirmed_by_customer is not None:
             draft.confirmed_by_customer = confirmed_by_customer
+        if seating_preference:
+            seating_preference = seating_preference.strip().lower()
 
+            if seating_preference not in ("indoor", "outdoor", "any"):
+                return {
+                    "status": "error",
+                    "message": "Seating preference must be indoor, outdoor, or any."
+                }
+
+            draft.update_field("seating_preference", seating_preference)
         # Check if we are ready for customer confirmation
         if draft.has_required_booking_fields() and self.session.last_availability_result and self.session.last_availability_result.get("available"):
             self.session.set_state(ConversationState.AWAITING_CUSTOMER_CONFIRMATION)
@@ -83,13 +93,13 @@ class AgentTools:
         reservation_date: str,
         reservation_time: str,
         guest_count: int,
+        seating_preference: Optional[str] = None,
+        mcp_result: Optional[Dict[str, Any]] = None,
         force_recheck: bool = False,
-            mcp_result: Optional[Dict[str, Any]] = None,
-
     ) -> Dict[str, Any]:
         """
         Check if tables are available on a specific date, time, and guest count.
-        Calls the restaurant backend API (with duplicate check caching).
+        Calls the restaurant backend API via MCP (with duplicate check caching).
         """
         # 1. Validate inputs via Guardrails
         valid_date, date_err = Guardrails.validate_reservation_date(reservation_date)
@@ -118,24 +128,43 @@ class AgentTools:
         draft.update_field("reservation_date", reservation_date)
         draft.update_field("reservation_time", reservation_time)
         draft.update_field("guest_count", guest_count)
+        if seating_preference:
+            draft.update_field("seating_preference", seating_preference.strip().lower())
 
         self.session.set_state(ConversationState.CHECKING_AVAILABILITY)
 
-       # 4. Use MCP result if provided; otherwise use the existing API.
-        if mcp_result is not None:
-           api_result = AvailabilityResponse.model_validate(mcp_result)
-        else:
-          req = AvailabilityRequest(
-              restaurant_id=draft.restaurant_id,
-              reservation_date=reservation_date,
-              reservation_time=reservation_time,
-              guest_count=guest_count,
-          )
-          api_result = restaurant_api.check_availability(req)
-
+        # 4. Check availability through the MCP server (with direct backend fallback if MCP offline)
+        try:
+            if mcp_result is None:
+                mcp_result = call_mcp_tool(
+                    "check_table_availability",
+                    {
+                        "reservation_date": reservation_date,
+                        "reservation_time": reservation_time,
+                        "guest_count": guest_count,
+                    },
+                )
+            api_result = AvailabilityResponse.model_validate(mcp_result)
+        except Exception as exc:
+            # Fallback to direct restaurant API client
+            from schemas.reservation import AvailabilityRequest
+            api_result = restaurant_api.check_availability(
+                AvailabilityRequest(
+                    restaurant_id=draft.restaurant_id,
+                    reservation_date=reservation_date,
+                    reservation_time=reservation_time,
+                    guest_count=guest_count,
+                )
+            )
+        print("Availability response:", api_result.model_dump())
+        
         # 5. Update session state based on backend response
         if api_result.available:
             draft.hold_token = api_result.hold_token
+            print("\n========== AVAILABILITY DEBUG ==========")
+            print("API hold token:", api_result.hold_token)
+            print("Draft hold token:", draft.hold_token)
+            print("=======================================\n")
             avail_result = {
                 "available": True,
                 "message": api_result.message,
@@ -175,15 +204,24 @@ class AgentTools:
         """
         self.session.set_state(ConversationState.SUGGESTING_ALTERNATIVES)
 
-        return call_mcp_tool(
-            "find_alternative_slots",
-            {
-                "restaurant_id": self.session.draft.restaurant_id,
-                "reservation_date": reservation_date,
-                "requested_time": requested_time,
-                "guest_count": guest_count,
-            },
-        )
+        try:
+            return call_mcp_tool(
+                "find_alternative_slots",
+                {
+                    "restaurant_id": self.session.draft.restaurant_id,
+                    "reservation_date": reservation_date,
+                    "requested_time": requested_time,
+                    "guest_count": guest_count,
+                },
+            )
+        except Exception:
+            alternatives = restaurant_api.get_alternatives(
+                restaurant_id=self.session.draft.restaurant_id,
+                reservation_date=reservation_date,
+                requested_time=requested_time,
+                guest_count=guest_count,
+            )
+            return {"alternatives": [alt.model_dump() for alt in alternatives]}
 
     
     def create_reservation(
@@ -191,7 +229,7 @@ class AgentTools:
         customer_name: Optional[str] = None,
         customer_phone: Optional[str] = None,
         special_requests: Optional[str] = None,
-        seating_preference="any",
+        seating_preference: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Create a confirmed table reservation in the backend database.
@@ -226,7 +264,13 @@ class AgentTools:
             }
 
         self.session.set_state(ConversationState.CREATING_RESERVATION)
-
+        print("\n========== BOOKING DEBUG ==========")
+        print("Reservation state:", self.session.state)
+        print("Hold token:", draft.hold_token)
+        print("Reservation date:", draft.reservation_date)
+        print("Reservation time:", draft.reservation_time)
+        print("Guest count:", draft.guest_count)
+        print("==================================\n")
         # Prepare backend booking payload (phone is optional)
         req = ReservationCreateRequest(
             hold_token=draft.hold_token,
@@ -238,14 +282,18 @@ class AgentTools:
             reservation_time=draft.reservation_time,
             guest_count=draft.guest_count,
             special_requests=draft.special_requests,
-            seating_preference="any",        )
+            seating_preference=seating_preference or draft.seating_preference or "any",
+        )
 
-        result = ReservationResponse.model_validate(
-            call_mcp_tool(
+        try:
+            mcp_data = call_mcp_tool(
                 "create_reservation",
                 req.model_dump(exclude_none=True),
             )
-        )
+            result = ReservationResponse.model_validate(mcp_data)
+        except Exception:
+            # Fallback to direct restaurant API client
+            result = restaurant_api.create_reservation(req)
 
         if result.status == "confirmed":
             self.session.set_state(ConversationState.RESERVATION_CONFIRMED)
@@ -264,20 +312,37 @@ class AgentTools:
             }
 
     def get_reservation_details(self, reservation_id: str) -> Dict[str, Any]:
-        """Look up an existing reservation through MCP."""
-        return call_mcp_tool(
-            "get_reservation",
-            {"reservation_id": reservation_id},
-        )       
-    def cancel_existing_reservation(self, reservation_id: str) -> Dict[str, Any]:
-        """Cancel an existing reservation through MCP."""
-        self.session.set_state(ConversationState.CANCELLING_RESERVATION)
-        result = call_mcp_tool(
-            "cancel_reservation",
-            {"reservation_id": reservation_id},
-        )
+        """Look up an existing reservation through MCP (with direct backend fallback)."""
+        try:
+            return call_mcp_tool(
+                "get_reservation",
+                {"reservation_id": reservation_id},
+            )
+        except Exception:
+            details = restaurant_api.get_reservation(reservation_id)
+            if details:
+                return {
+                    "found": True,
+                    "details": details.model_dump(),
+                }
+            return {
+                "found": False,
+                "message": f"No reservation found with ID {reservation_id}.",
+            }
 
-        if result.get("cancelled"):
+    def cancel_existing_reservation(self, reservation_id: str) -> Dict[str, Any]:
+        """Cancel an existing reservation through MCP (with direct backend fallback)."""
+        self.session.set_state(ConversationState.CANCELLING_RESERVATION)
+        try:
+            result = call_mcp_tool(
+                "cancel_reservation",
+                {"reservation_id": reservation_id},
+            )
+            cancelled = result.get("cancelled", False)
+        except Exception:
+            cancelled = restaurant_api.cancel_reservation(reservation_id)
+
+        if cancelled:
             return {
                 "status": "success",
                 "message": f"Reservation {reservation_id} has been cancelled.",
@@ -287,3 +352,48 @@ class AgentTools:
             "status": "failed",
             "message": f"Could not cancel reservation {reservation_id}.",
         }
+
+    def update_confirmed_reservation(
+        self,
+        reservation_id: str,
+        reservation_date: Optional[str] = None,
+        reservation_time: Optional[str] = None,
+        guest_count: Optional[int] = None,
+        seating_preference: Optional[str] = None,
+        special_requests: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Update an existing confirmed reservation through MCP (with direct backend fallback)."""
+        self.session.set_state(ConversationState.MODIFYING_RESERVATION)
+        try:
+            return call_mcp_tool(
+                "update_reservation",
+                {
+                    "reservation_id": reservation_id,
+                    "reservation_date": reservation_date or "",
+                    "reservation_time": reservation_time or "",
+                    "guest_count": guest_count or 0,
+                    "seating_preference": seating_preference or "",
+                    "special_requests": special_requests or "",
+                },
+            )
+        except Exception:
+            details = restaurant_api.update_reservation(
+                reservation_id=reservation_id,
+                reservation_date=reservation_date,
+                reservation_time=reservation_time,
+                guest_count=guest_count,
+                seating_preference=seating_preference,
+                special_requests=special_requests,
+            )
+            if details:
+                return {
+                    "updated": True,
+                    "reservation_id": reservation_id,
+                    "details": details.model_dump(),
+                    "message": f"Reservation {reservation_id} updated successfully.",
+                }
+            return {
+                "updated": False,
+                "reservation_id": reservation_id,
+                "message": f"Could not find or update reservation with ID {reservation_id}.",
+            }

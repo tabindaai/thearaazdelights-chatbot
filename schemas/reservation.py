@@ -52,7 +52,10 @@ class AvailabilityResponse(BaseModel):
 
 class ReservationCreateRequest(BaseModel):
     """Payload sent to create a confirmed reservation."""
-    hold_token: Optional[str] = Field(default=None, description="Hold token from availability check if required")
+    hold_token: str = Field(
+        min_length=1,
+        description="Required hold token from availability check"
+    )    
     customer_name: str = Field(min_length=2, description="Name of the person making the booking")
     customer_phone: Optional[str] = Field(default=None, description="Contact phone number (optional)")
     customer_email: Optional[str] = Field(default=None, description="Contact email")
@@ -61,6 +64,7 @@ class ReservationCreateRequest(BaseModel):
     reservation_time: str = Field(description="Time in HH:MM format")
     guest_count: int = Field(gt=0, le=20, description="Number of guests")
     special_requests: Optional[str] = Field(default=None, description="Dietary needs, birthday, window table, etc.")
+    seating_preference: str = Field(default="any",description="Preferred seating: indoor, outdoor, or any.")
 
 
 class ReservationDetails(BaseModel):

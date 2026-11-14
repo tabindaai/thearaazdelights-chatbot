@@ -194,7 +194,7 @@ with st.sidebar:
 # ============================================================================
 st.markdown("""
 <div class="main-header">
-    <div class="restaurant-title">🍽️ The  Araaz Delights</div>
+    <div class="restaurant-title">🍽️ The Araaz Delights</div>
     <div class="restaurant-subtitle">Fine Dining • Reservations & Inquiries Concierge</div>
 </div>
 """, unsafe_allow_html=True)

@@ -41,6 +41,7 @@ class ReservationDraft(BaseModel):
     guest_count: Optional[int] = None
     special_requests: Optional[str] = None
     hold_token: Optional[str] = None
+    seating_preference: str = "any"
     confirmed_by_customer: bool = False
 
     def is_ready_for_availability_check(self) -> bool:

@@ -170,19 +170,98 @@ class RestaurantAPIClient:
     # ------------------------------------------------------------------------
     # 5. CANCEL RESERVATION
     # ------------------------------------------------------------------------
+   
     def cancel_reservation(self, reservation_id: str) -> bool:
         """Cancel an existing reservation."""
+
         if self.use_mock:
-            return True
+            for booking in self._mock_db_reservations:
+                if booking.get("reservation_id") == reservation_id:
+                    self._mock_db_reservations.remove(booking)
+                    logger.info(
+                        f"[MOCK BACKEND] Cancelled reservation "
+                        f"{reservation_id}"
+                    )
+                    return True
+
+            return False
 
         url = f"{self.base_url}/reservations/{reservation_id}"
+
         try:
             with httpx.Client(timeout=TIMEOUT_SECONDS) as client:
                 response = client.delete(url)
                 return response.status_code in (200, 204)
         except httpx.HTTPError as exc:
-            logger.error(f"Error cancelling reservation {reservation_id}: {exc}")
+            logger.error(
+                f"Error cancelling reservation {reservation_id}: {exc}"
+            )
             return False
+
+    # ------------------------------------------------------------------------
+    # 6. UPDATE EXISTING RESERVATION
+    # ------------------------------------------------------------------------
+    def update_reservation(
+        self,
+        reservation_id: str,
+        reservation_date: Optional[str] = None,
+        reservation_time: Optional[str] = None,
+        guest_count: Optional[int] = None,
+        seating_preference: Optional[str] = None,
+        special_requests: Optional[str] = None,
+    ) -> Optional[ReservationDetails]:
+        """Update details of an existing confirmed reservation."""
+        if self.use_mock:
+            for booking in self._mock_db_reservations:
+                if booking.get("reservation_id") == reservation_id:
+                    if reservation_date:
+                        booking["date"] = reservation_date
+                    if reservation_time:
+                        booking["time"] = reservation_time
+                    if guest_count and guest_count > 0:
+                        booking["guest_count"] = guest_count
+                    if seating_preference:
+                        booking["seating_preference"] = seating_preference
+                    if special_requests:
+                        booking["special_requests"] = special_requests
+                    logger.info(f"[MOCK BACKEND] Updated reservation {reservation_id}: {booking}")
+                    return ReservationDetails(
+                        reservation_id=booking["reservation_id"],
+                        customer_name=booking["name"],
+                        customer_phone=booking.get("customer_phone", "Not provided"),
+                        restaurant_id=booking.get("restaurant_id", "rest_01"),
+                        reservation_date=booking["date"],
+                        reservation_time=booking["time"],
+                        guest_count=booking["guest_count"],
+                        table_number=booking.get("table_number", 1),
+                        status="confirmed",
+                    )
+            return None
+
+        url = f"{self.base_url}/reservations/{reservation_id}"
+        payload = {}
+        if reservation_date:
+            payload["reservation_date"] = reservation_date
+        if reservation_time:
+            payload["reservation_time"] = reservation_time
+        if guest_count:
+            payload["guest_count"] = guest_count
+        if seating_preference:
+            payload["seating_preference"] = seating_preference
+        if special_requests:
+            payload["special_requests"] = special_requests
+
+        try:
+            with httpx.Client(timeout=TIMEOUT_SECONDS) as client:
+                response = client.patch(url, json=payload)
+                if response.status_code == 404:
+                    return None
+                response.raise_for_status()
+                return ReservationDetails(**response.json())
+        except httpx.HTTPError as exc:
+            logger.error(f"Error updating reservation {reservation_id}: {exc}")
+            return None
+
 
     # ========================================================================
     # SIMULATED / MOCK IMPLEMENTATIONS (For development before colleague APIs)
@@ -254,9 +333,13 @@ class RestaurantAPIClient:
         self._mock_db_reservations.append({
             "reservation_id": generated_id,
             "name": req.customer_name,
+            "customer_phone": req.customer_phone or "Not provided",
+            "restaurant_id": req.restaurant_id,
             "date": req.reservation_date,
             "time": req.reservation_time,
+            "table_number": len(self._mock_db_reservations) + 1,
             "guest_count": req.guest_count,
+            "status": "confirmed"
         })
 
         logger.info(f"[MOCK BACKEND] Created reservation {generated_id} for {req.customer_name}. Total reservations in mock DB: {len(self._mock_db_reservations)}")
@@ -267,19 +350,33 @@ class RestaurantAPIClient:
             message="Reservation confirmed successfully in backend database."
         )
 
-    def _mock_get_reservation(self, reservation_id: str) -> Optional[ReservationDetails]:
-        """Simulate fetching an existing reservation."""
-        return ReservationDetails(
-            reservation_id=reservation_id,
-            customer_name="Tabinda",
-            customer_phone="+1234567890",
-            restaurant_id="rest_01",
-            reservation_date="2026-11-07",
-            reservation_time="20:00",
-            guest_count=4,
-            table_number=12,
-            status="confirmed"
-        )
+    
+    def _mock_get_reservation(
+        self,
+        reservation_id: str
+    ) -> Optional[ReservationDetails]:
+        """Fetch a reservation from the mock database."""
+
+        for booking in self._mock_db_reservations:
+            if booking.get("reservation_id") == reservation_id:
+                return ReservationDetails(
+                    reservation_id=booking["reservation_id"],
+                    customer_name=booking["name"],
+                    customer_phone=booking.get(
+                        "customer_phone", "Not provided"
+                    ),
+                    restaurant_id=booking.get(
+                        "restaurant_id", "rest_01"
+                    ),
+                    reservation_date=booking["date"],
+                    reservation_time=booking["time"],
+                    guest_count=booking["guest_count"],
+                    table_number=booking.get("table_number", 1),
+                    status=booking.get("status", "confirmed")
+                )
+
+        return None
+
 
 
 # Global singleton instance for easy import across modules
