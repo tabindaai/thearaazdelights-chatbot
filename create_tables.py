@@ -1,15 +1,11 @@
 
-from services.db import engine
+from services.db import Base, engine
+import services.models
+
 
 if engine is None:
     raise RuntimeError("Database is not configured.")
 
-with engine.connect() as connection:
-    result = connection.exec_driver_sql(
-        "SELECT table_name FROM information_schema.tables "
-        "WHERE table_schema = 'public'"
-    )
+Base.metadata.create_all(bind=engine)
 
-    print("Tables in PostgreSQL:")
-    for row in result:
-        print(row[0])
+print("Tables created successfully (if they did not already exist).")

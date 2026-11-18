@@ -335,6 +335,7 @@ thearaazdelights-chatbot/
 ├── main.py
 ├── mcp_server.py
 ├── test_mcp_client.py
+├── verify_get_reservation.py
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
@@ -421,7 +422,12 @@ After configuring PostgreSQL, run:
 python create_tables.py
 ```
 
-This creates the reservation table using the SQLAlchemy models if it does not already exist.
+
+This runs the SQLAlchemy schema initialization script.
+It creates the database tables registered in the SQLAlchemy
+models if they do not already exist.
+
+The script uses `Base.metadata.create_all()` from SQLAlchemy.
 
 ## Running the Project
 
@@ -557,6 +563,26 @@ The verification covered:
 - Mock backend initialization, availability checking, and reservation creation.
 
 The mock backend checks were performed directly through the restaurant API client. The PostgreSQL reservation workflow was tested through the MCP client and `AgentTools`.
+
+### PostgreSQL Persistence Verification After MCP Restart
+
+The persistence test was performed using a separate script:
+`verify_get_reservation.py`.
+
+Verification procedure:
+
+1. Created a reservation using the PostgreSQL backend.
+2. Saved the generated reservation ID.
+3. Restarted the MCP server.
+4. Executed `get_reservation` using the original reservation ID.
+5. Successfully retrieved the original reservation details.
+
+**Result: Successful**
+
+The MCP tool returned `"found": true` and the original
+reservation details, confirming that the reservation remained
+available after the MCP server restarted.
+
 
 ## Current Implementation Status
 
