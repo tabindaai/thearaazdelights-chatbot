@@ -5,7 +5,10 @@ MCP Server for The Araaz Delights.
 Exposes restaurant reservation operations to AI clients.
 """
 
+from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+
+load_dotenv()
 from schemas.reservation import (
     AvailabilityRequest,
     ReservationCreateRequest,

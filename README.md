@@ -1,348 +1,400 @@
-# Araaz Delights – AI-Powered Restaurant Reservation Chatbot
+# The Araaz Delights – AI-Powered Restaurant Reservation Chatbot with Google Calendar MCP Integration
 
-Araaz Delights is an AI-powered restaurant reservation chatbot designed to simplify table booking through natural language conversations.
+The Araaz Delights is an AI-powered restaurant reservation concierge designed to handle table bookings through natural, human-like conversations. Powered by Google's Gemini model and an AI assistant named **Aria**, the system guides guests through checking table availability, selecting preferences, confirming bookings, and automatically synchronizing reservations with their personal **Google Calendar** with an automated **3-hour reminder**.
 
-Customers can interact with an AI assistant to check table availability, make reservations, retrieve booking details, update existing reservations, find alternative time slots, and cancel reservations.
+The architecture uses the **Model Context Protocol (MCP)** to connect conversational AI to backend tools through a **single unified MCP client** communicating over Streamable HTTP with two independent MCP servers: the **Restaurant MCP Server** (for table bookings) and the **Google Calendar MCP Server** (for calendar event management).
 
-The project uses Google's Gemini model for conversational intelligence and the Model Context Protocol (MCP) to connect the AI application with reservation-management tools through a dedicated MCP client-server architecture.
+---
 
-PostgreSQL provides persistent reservation storage, while the application also supports an in-memory mock backend and an external HTTP API backend.
+## Table of Contents
+
+- [Key Features](#key-features)
+- [Technology Stack](#technology-stack)
+- [System Architecture](#system-architecture)
+- [Project Folder Structure](#project-folder-structure)
+- [How the Unified MCP Client Connects to Both Servers](#how-the-unified-mcp-client-connects-to-both-servers)
+- [Customer Email Collection & Validation](#customer-email-collection--validation)
+- [Google OAuth 2.0 Authorization Flow](#google-oauth-20-authorization-flow)
+- [Automatic Calendar Synchronization](#automatic-calendar-synchronization)
+- [3-Hour (180-Minute) Reminder Configuration](#3-hour-180-minute-reminder-configuration)
+- [Reservation Update & Cancellation Synchronization](#reservation-update--cancellation-synchronization)
+- [Database Schema & Migrations](#database-schema--migrations)
+- [Google Cloud Project & Calendar API Setup](#google-cloud-project--calendar-api-setup)
+- [Installation and Environment Configuration](#installation-and-environment-configuration)
+- [Running the Complete System](#running-the-complete-system)
+- [Testing & Verification](#testing--verification)
+- [Security Considerations](#security-considerations)
+
+---
 
 ## Key Features
 
-- **AI-Powered Conversations:** Natural language interaction using Google's Gemini API.
-- **Reservation Management:** Collects customer names, dates, times, guest counts, and seating preferences through conversation.
-- **Availability Checking:** Checks table availability for the requested date, time, and number of guests.
-- **Alternative Suggestions:** Suggests alternative reservation slots when the requested time is unavailable.
-- **Booking Confirmation:** Creates reservations after customer approval.
-- **Reservation Retrieval:** Retrieves existing reservation details.
-- **Reservation Updating:** Allows customers to modify existing reservation details.
-- **Reservation Cancellation:** Supports cancellation of existing reservations.
-- **Conversation Memory:** Maintains session-based conversation context to avoid repeatedly asking for previously provided information.
-- **Input Validation and Guardrails:** Validates reservation details and helps prevent invalid or unintended operations.
-- **MCP Integration:** Uses a dedicated MCP client and server for reservation-related tool execution.
-- **PostgreSQL Persistence:** Stores confirmed reservations in a PostgreSQL database.
-- **Multiple Backend Modes:** Supports PostgreSQL, an external HTTP API, and an in-memory mock backend.
-- **Streamlit Interface:** Provides a user-friendly chat interface.
+- **Natural AI Concierge (Aria):** Understands greetings (*hello, hi, namaste*), relative dates (*tomorrow, next Friday*), natural times (*7 PM, 19:30*), polite acknowledgments, and conversation closings.
+- **Mandatory Email Collection:** Collects customer name, email address, reservation date, time, and guest count naturally without repetitive questioning. Phone number is strictly optional.
+- **Table Availability Checking:** Verifies real-time table capacity and returns alternative slots when a preferred time is booked out.
+- **Two Independent MCP Servers:** Separates restaurant database operations (Port `8001`) from Google Calendar operations (Port `8002`).
+- **Single Unified MCP Client (`agent/mcp_client.py`):** A single persistent bridge managing concurrent connections to both MCP servers with automatic tool routing and fault isolation.
+- **Customer Google Calendar Integration:** Connects the customer's personal Google account using secure Google OAuth 2.0 authorization.
+- **Automatic 3-Hour Reminders:** Schedules a Google Calendar popup reminder exactly **180 minutes** before the reservation time.
+- **Full Life-Cycle Calendar Sync:** Updating a reservation updates the calendar event; cancelling a reservation deletes the calendar event.
+- **Decoupled & Optional Calendar:** Restaurant reservations always succeed even if the guest has not connected Google Calendar or if calendar services are temporarily offline.
+- **PostgreSQL & In-Memory Mock Modes:** Seamlessly toggles between PostgreSQL database persistence, external colleague HTTP backend, and an in-memory mock backend.
+- **Streamlit Interactive UI:** Customer-facing chat interface featuring real-time booking state, sidebar session reset, and one-click Google Calendar connection.
+
+---
 
 ## Technology Stack
 
-| Component | Technology |
-|---|---|
-| Programming Language | Python |
-| AI Model | Google Gemini |
-| AI Integration | Google GenAI SDK |
-| Backend API | FastAPI |
-| Frontend | Streamlit |
-| MCP Framework | MCP Python SDK / FastMCP |
-| MCP Transport | Streamable HTTP |
-| Database | PostgreSQL |
-| ORM | SQLAlchemy |
-| Database Driver | Psycopg |
-| Data Validation | Pydantic |
-| HTTP Communication | HTTPX |
-| Environment Configuration | python-dotenv |
-| Testing | Pytest |
+| Component | Technology | Description |
+|---|---|---|
+| **Programming Language** | Python 3.11+ / 3.13 | Core runtime environment |
+| **Conversational AI** | Google Gemini (`gemini-2.5-flash` / `gemini-3.5-flash-lite`) | Natural language understanding & function calling |
+| **AI SDK** | Google GenAI SDK (`google-genai`) | Official client for system prompts and tool calling |
+| **Backend API** | FastAPI + Uvicorn | REST endpoints for chat, session management, and OAuth |
+| **Frontend UI** | Streamlit | Responsive customer chat interface and sidebar controls |
+| **Protocol Architecture** | Model Context Protocol (MCP) | Standardized client-server tool execution protocol |
+| **MCP Framework** | FastMCP (`mcp` Python SDK) | Lightweight Streamable HTTP servers |
+| **Calendar API** | Google Calendar API v3 | `google-api-python-client`, `google-auth-oauthlib` |
+| **Database (Reservations)** | PostgreSQL + SQLAlchemy 2.0 | Persistent reservation storage |
+| **Database (OAuth Tokens)** | SQLite (`oauth_tokens.db`) | Dedicated server-side token store with thread locks |
+| **Validation & Schemas** | Pydantic v2 | Schema enforcement and runtime data validation |
+| **Testing** | Pytest + Pytest-Asyncio | Unit and integration test suite |
 
-## Project Architecture
+---
 
-The application follows a modular architecture that separates the frontend, chatbot logic, MCP communication, reservation operations, and database persistence.
+## System Architecture
+
+The application implements a clean separation of concerns: conversational orchestration, tool execution protocol, business domain, and external service layers.
 
 ### Architecture Diagram
 
-```text
-                    CUSTOMER
-                       |
-                       v
-              STREAMLIT FRONTEND
-                       |
-                       v
-                FASTAPI BACKEND
-                       |
-                       v
-                 GEMINI AI AGENT
-                       |
-                       v
-                 AGENT / TOOLS.PY
-                       |
-                       v
-              MCP CLIENT
-           (agent/mcp_client.py)
-                       |
-                       | Streamable HTTP
-                       v
-                 MCP SERVER
-                (mcp_server.py)
-                       |
-                       v
-            RESTAURANT API SERVICE
-          (services/restaurant_api.py)
-                       |
-             +---------+----------+
-             |         |          |
-             v         v          v
-         PostgreSQL  HTTP API   Mock Backend
-           Backend   Backend   (In-Memory)
-             |
-             v
-       SQLAlchemy ORM
-             |
-             v
-       PostgreSQL Database
+```mermaid
+flowchart TD
+    User([Customer / Guest]) <--> UI[Streamlit Frontend\n:8501]
+    UI <--> API[FastAPI Backend\nmain.py :8000]
+    API <--> Agent[Gemini AI Concierge\nagent/chatbot.py]
+    Agent <--> Tools[Agent Tools Bridge\nagent/tools.py]
+    
+    Tools <--> MCPClient[Unified MCP Client\nagent/mcp_client.py]
+    
+    MCPClient <-- Streamable HTTP :8001 --> RestMCP[Restaurant MCP Server\nmcp_server.py :8001]
+    MCPClient <-- Streamable HTTP :8002 --> CalMCP[Google Calendar MCP Server\ncalendar_mcp_server.py :8002]
+    
+    RestMCP <--> RestAPI[Restaurant API Service\nservices/restaurant_api.py]
+    RestAPI <--> DB[(PostgreSQL Database\nreservations table)]
+    
+    CalMCP <--> CalService[Calendar Service\nservices/calendar_service.py]
+    CalService <--> OAuthStore[(SQLite Store\noauth_tokens.db)]
+    CalService <--> GCalAPI[Google Calendar API v3\naccounts.google.com / Google Cloud]
 ```
 
-### Architecture Explanation
+### Flow Summary
 
-1. **Streamlit Frontend:** Provides the customer-facing chat interface and sends messages to the FastAPI backend.
-2. **FastAPI Backend:** Receives requests, manages sessions, and communicates with the chatbot.
-3. **Gemini AI Agent:** Understands customer messages and determines when reservation-related tools are required.
-4. **Agent Tools:** Handles reservation operations and routes tool requests through the MCP client.
-5. **MCP Client:** Establishes a connection with the MCP server using Streamable HTTP and sends tool execution requests.
-6. **MCP Server:** Exposes reservation-related tools and executes requested operations.
-7. **Restaurant API Service:** Handles reservation operations and selects the configured backend.
-8. **PostgreSQL Backend:** Uses SQLAlchemy to store and retrieve persistent reservation records.
+1. **Guest interacts with Streamlit:** Messages are sent via HTTP POST `/chat` to FastAPI.
+2. **FastAPI & Agent:** FastAPI routes messages into `RestaurantChatbotAgent`, evaluating input guardrails, dynamic system prompts, and conversation history.
+3. **Gemini Tool Calling:** Gemini decides which tools to invoke (`check_table_availability`, `update_reservation_details`, `create_reservation`, etc.).
+4. **AgentTools Execution:** `AgentTools` passes tool calls to `call_mcp_tool()`.
+5. **Unified MCP Client Routing:** `agent/mcp_client.py` determines whether the tool belongs to the restaurant domain or calendar domain, routing it to Port `8001` or Port `8002`.
+6. **Backend Execution:**
+   - Restaurant tools execute against PostgreSQL/mock database via `services/restaurant_api.py`.
+   - Calendar tools execute against Google Calendar API using stored OAuth tokens via `services/calendar_service.py`.
 
-The chatbot's reservation operations communicate with the restaurant backend through MCP. The AI agent does not directly access PostgreSQL.
+---
 
-## Model Context Protocol (MCP) Integration
-
-A major part of this project is the implementation of a separate MCP server and MCP client.
-
-The purpose is to demonstrate how an AI application can communicate with external tools through a standardized protocol instead of directly coupling chatbot logic to backend operations.
-
-### 1. MCP Server
-
-The MCP server is implemented using FastMCP in `mcp_server.py`.
-
-It exposes seven tools:
-
-| Tool | Description |
-|---|---|
-| `test_connection` | Checks whether the MCP server is working. |
-| `check_table_availability` | Checks availability for a requested reservation. |
-| `create_reservation` | Creates a restaurant reservation. |
-| `get_reservation` | Retrieves reservation details. |
-| `cancel_reservation` | Cancels an existing reservation. |
-| `find_alternative_slots` | Finds alternative available reservation times. |
-| `update_reservation` | Updates an existing reservation. |
-
-The MCP server receives tool requests, executes the corresponding operations through the restaurant API service, and returns the results to the client.
-
-### 2. MCP Client
-
-The MCP client is implemented in `agent/mcp_client.py`.
-
-Its responsibilities include:
-
-- Connecting to the MCP server through its configured URL.
-- Establishing an MCP session.
-- Initializing the protocol connection.
-- Sending tool execution requests.
-- Receiving and processing tool results.
-- Maintaining a persistent connection for multiple tool calls.
-- Closing the connection gracefully.
-
-The server URL is configured through the `MCP_SERVER_URL` environment variable.
-
-### 3. MCP Communication Flow
-
-The MCP communication follows these steps:
-
-**Step 1 – Initialize**
-
-The client connects to the MCP server and sends an initialization request.
+## Project Folder Structure
 
 ```text
-Client -> Server: initialize
-Server -> Client: initialization response
-```
-
-**Step 2 – Discover Available Tools**
-
-The client requests the tools exposed by the server.
-
-```text
-Client -> Server: tools/list
-Server -> Client: available tools
-```
-
-**Step 3 – Execute a Tool**
-
-When a reservation operation is required, the client sends a tool execution request.
-
-```text
-Client -> Server: tools/call
-                 Tool name + arguments
-```
-
-**Step 4 – Receive the Result**
-
-```text
-Server -> Client: tool execution result
-```
-
-The client processes the response and makes it available to the application.
-
-Overall:
-
-```text
-initialize
-    |
-    v
-tools/list
-    |
-    v
-tools/call
-    |
-    v
-tool execution
-    |
-    v
-result returned to client
-```
-
-### 4. MCP vs Gemini Function Calling
-
-MCP and Gemini function calling serve different purposes.
-
-**Gemini Function Calling:**
-
-Gemini understands the customer's message and determines when a reservation-related tool needs to be used. It identifies the appropriate tool and its arguments based on the conversation.
-
-**Model Context Protocol:**
-
-MCP provides the communication protocol between the application-side MCP client and the MCP server. It allows the client to discover available tools and execute them through a standardized interface.
-
-In this project, Gemini determines **when and which tool to use**, while MCP handles **how the application communicates with the server to execute that tool**.
-
-## Database Integration and Persistence
-
-The project uses PostgreSQL for persistent reservation storage.
-
-Database connection and session management are implemented in:
-
-- `services/db.py`
-- `services/models.py`
-
-The database operations are integrated into `services/restaurant_api.py`.
-
-SQLAlchemy is used as the ORM, and Psycopg is used as the PostgreSQL driver.
-
-### Reservation Model
-
-The `reservations` table stores reservation information, including:
-
-- Reservation ID
-- Customer name
-- Customer phone and email (optional)
-- Restaurant ID
-- Reservation date and time
-- Guest count
-- Seating preference
-- Special requests
-- Table number
-- Reservation status
-- Hold token
-- Creation and update timestamps
-
-### Reservation Persistence
-
-Confirmed reservations are stored in PostgreSQL and remain available after the MCP server restarts.
-
-Cancellation uses a status update rather than permanently deleting the reservation record. This preserves the reservation history.
-
-### Temporary Availability Holds
-
-When a table availability check succeeds, the backend generates a temporary hold token.
-
-- Holds expire after 10 minutes.
-- Temporary holds are maintained in process memory.
-- Confirmed reservations are persisted in PostgreSQL.
-- Temporary holds are not intended to survive an MCP server restart.
-
-This separates temporary availability management from permanent reservation storage.
-
-## Backend Configuration Modes
-
-The restaurant API service supports three backend modes.
-
-### 1. PostgreSQL Mode
-
-PostgreSQL mode provides persistent reservation storage.
-
-It is selected when:
-
-```env
-USE_MOCK_BACKEND=false
-```
-
-and valid PostgreSQL database configuration is available.
-
-### 2. External HTTP API Mode
-
-If mock mode is disabled but PostgreSQL is not configured, the service can use the colleague's external restaurant HTTP API.
-
-Configure its base URL using:
-
-```env
-RESTAURANT_API_BASE_URL=http://localhost:8002
-```
-
-### 3. Mock Backend Mode
-
-Mock mode uses in-memory storage and does not require a PostgreSQL connection.
-
-Enable it using:
-
-```env
-USE_MOCK_BACKEND=true
-```
-
-Mock reservation data is temporary and is not persisted across application restarts.
-
-## Project Structure
-
-```text
-thearaazdelights-chatbot/
+restaurant_ai_chatbot/
 │
 ├── agent/
-│   ├── chatbot.py
-│   ├── guardrails.py
-│   ├── mcp_client.py
-│   ├── memory.py
-│   ├── prompts.py
-│   └── tools.py
+│   ├── __init__.py
+│   ├── chatbot.py              # Gemini conversational orchestrator & tool execution loop
+│   ├── guardrails.py           # Input sanitization, email validation, and topic filters
+│   ├── mcp_client.py           # Unified persistent MCP client connecting to both servers
+│   ├── memory.py               # Session memory, FSM states, and ReservationDraft
+│   ├── prompts.py              # Dynamic system prompt builder with runtime context
+│   └── tools.py                # AgentTools binding session logic to MCP calls
 │
 ├── frontend/
-│   └── app.py
+│   └── app.py                  # Streamlit chat interface with Google Calendar sidebar controls
 │
 ├── schemas/
-│   ├── chat.py
-│   └── reservation.py
+│   ├── __init__.py
+│   ├── chat.py                 # Pydantic models for chat requests and responses
+│   └── reservation.py          # Data validation models for availability and bookings
 │
 ├── services/
-│   ├── db.py
-│   ├── models.py
-│   └── restaurant_api.py
+│   ├── __init__.py
+│   ├── calendar_service.py     # Google Calendar API v3 client (CRUD & 3-hour reminder)
+│   ├── db.py                   # SQLAlchemy engine, session maker, and connection logic
+│   ├── models.py               # SQLAlchemy models (Reservation with calendar_event_id)
+│   ├── oauth_store.py          # SQLite token store for Google OAuth tokens
+│   └── restaurant_api.py       # Restaurant backend service (PostgreSQL, mock, HTTP)
 │
 ├── tests/
-│   ├── test_availability.py
-│   ├── test_guardrails.py
-│   ├── test_memory.py
-│   └── test_reservation.py
+│   ├── __init__.py
+│   ├── test_availability.py    # Availability and capacity limit unit tests
+│   ├── test_guardrails.py      # Input, email, and confirmation gate guardrail tests
+│   ├── test_memory.py          # Multi-turn memory and draft accumulation tests
+│   └── test_reservation.py     # End-to-end booking scenarios
 │
-├── create_tables.py
-├── main.py
-├── mcp_server.py
-├── test_mcp_client.py
-├── verify_get_reservation.py
-├── requirements.txt
-├── .env.example
+├── calendar_mcp_server.py      # FastMCP Google Calendar server (port 8002)
+├── create_tables.py            # PostgreSQL database table initialization script
+├── main.py                     # FastAPI backend application with OAuth routes
+├── mcp_server.py               # FastMCP Restaurant server (port 8001)
+├── test_mcp_client.py          # Standalone MCP client testing demo script
+├── verify_get_reservation.py   # MCP restart persistence verification script
+├── requirements.txt            # Python package dependencies
+├── .env.example                # Safe environment variable configuration template
 ├── .gitignore
 └── README.md
 ```
 
-## Installation and Setup
+---
+
+## How the Unified MCP Client Connects to Both Servers
+
+A key design requirement is **one unified MCP client** (`agent/mcp_client.py`) rather than separate disconnected client files.
+
+### 1. Dual Persistent Sessions
+`MCPClient` runs an isolated background thread with its own asyncio event loop. When initialized, it establishes two concurrent Streamable HTTP protocol sessions:
+- **`restaurant_session`** connected to `http://127.0.0.1:8001/mcp`
+- **`calendar_session`** connected to `http://127.0.0.1:8002/mcp`
+
+### 2. Intelligent Tool Routing
+When `call_mcp_tool(tool_name, arguments)` is invoked, the client checks the target tool against a registered set of calendar tools:
+
+```python
+CALENDAR_TOOLS = {
+    "test_calendar_connection",
+    "create_calendar_event",
+    "update_calendar_event",
+    "delete_calendar_event",
+}
+```
+
+- If `tool_name in CALENDAR_TOOLS`: Routed directly to the **Calendar MCP Server** (Port `8002`).
+- Otherwise: Routed to the **Restaurant MCP Server** (Port `8001`).
+
+### 3. Fault Isolation & Auto-Reconnection
+- If the Calendar MCP server is not running or offline, calendar operations fail gracefully with a descriptive error dict, **without raising unhandled exceptions or interrupting restaurant bookings**.
+- If either server is restarted, the client automatically attempts on-demand reconnection during the next tool call.
+
+---
+
+## Customer Email Collection & Validation
+
+Aria collects the customer's email address as a mandatory detail before confirming the reservation.
+
+### Mandatory Booking Details
+1. **Customer Name**
+2. **Customer Email Address** (required for confirmation and Google Calendar reminders)
+3. **Reservation Date** (`YYYY-MM-DD`)
+4. **Reservation Time** (`HH:MM` 24-hour format)
+5. **Number of Guests** (`1` to `20`)
+
+*Phone number is strictly optional.*
+
+### Validation & Behavior
+- **Regex Format Validation:** Evaluated by `Guardrails.validate_email()`:
+  ```regex
+  ^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$
+  ```
+- **Context-Aware Topic Guard:** Email addresses provided naturally (e.g. `arun.kumar@gmail.com` or `my email is test@domain.com`) are recognized as valid detail answers and are never blocked as off-topic.
+- **Correction Support:** Customers can update or correct their email address at any point before confirmation.
+- **Privacy:** Email addresses are never exposed in system error logs or leaked to third-party endpoints.
+
+---
+
+## Google OAuth 2.0 Authorization Flow
+
+To save confirmed bookings directly into the customer's own Google Calendar, the application implements a secure OAuth 2.0 Authorization Code Flow.
+
+### Sequence of Authorization
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Customer
+    participant UI as Streamlit (:8501)
+    participant API as FastAPI (:8000)
+    participant Google as Google Accounts
+    participant DB as SQLite (oauth_tokens.db)
+
+    Customer->>UI: Clicks "Connect Google Calendar"
+    UI->>API: GET /auth/google?session_id=XYZ
+    API->>API: Generates CSRF state token
+    API-->>Customer: 307 Redirect to Google Consent Screen
+    Customer->>Google: Authenticates & grants calendar.events scope
+    Google-->>API: 302 Redirect to /auth/callback?code=...&state=...
+    API->>API: Validates state against active session
+    API->>Google: Exchanges code for access & refresh tokens
+    Google-->>API: Returns tokens + ID token
+    API->>DB: Stores encrypted tokens & user's Google email
+    API-->>UI: Redirects to :8501?oauth_success=1
+    UI->>UI: Updates sidebar: "Connected as user@gmail.com"
+```
+
+### OAuth Endpoints in `main.py`
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/auth/google` | `GET` | Initiates flow; generates CSRF `state`, maps to `session_id`, redirects to Google consent URL. |
+| `/auth/callback` | `GET` | Callback handler; validates `state`, exchanges `code` for tokens, stores tokens, redirects back to Streamlit. |
+| `/auth/status/{session_id}` | `GET` | Returns connection status, authorized Google email, and token validity for a session. |
+| `/auth/disconnect/{session_id}` | `POST` | Revokes stored tokens and clears session calendar authorization. |
+
+### Email Mismatch Handling
+If the Google account authorized via OAuth differs from the email collected during conversation (e.g., booked for `work@company.com`, but authorized Google account is `personal@gmail.com`), Aria explicitly communicates which account holds the event:
+> *"Saved to your calendar (saved to connected Google account: `personal@gmail.com`) with a reminder 3 hours before!"*
+
+---
+
+## Automatic Calendar Synchronization
+
+Once the restaurant backend confirms a table booking, the application triggers calendar synchronization:
+
+1. **Pre-condition:** `create_reservation` returns `status == "confirmed"`.
+2. **Authorization Check:** The system verifies `session.google_calendar_authorized`.
+3. **Event Body Structure:**
+   - **Summary:** `Restaurant Reservation - Araaz Delights`
+   - **Start Time:** Reservation date & time in ISO-8601 with configured timezone (`CALENDAR_TIMEZONE`).
+   - **End Time:** Automatically calculated as 2 hours after start time.
+   - **Location:** `The Araaz Delights, 123 Fine Dining Avenue`
+   - **Description:** Clean summary containing Reservation ID, Guest Name, Guest Email, Party Size, Seating Preference, and Special Requests.
+   - **Duplicate Prevention:** The generated Google Calendar `event_id` is saved to `session.last_confirmed_calendar_event_id` and database column `calendar_event_id`. Subsequent calls detect the existing ID and do not create duplicates.
+
+---
+
+## 3-Hour (180-Minute) Reminder Configuration
+
+### Reminder Setting
+The event reminder is configured within the event creation payload:
+
+```python
+"reminders": {
+    "useDefault": False,
+    "overrides": [
+        {"method": "popup", "minutes": 180}
+    ]
+}
+```
+
+### Explanation of Notification Types
+- **Calendar Event Reminders (Implemented):** Configured via the `reminders.overrides` property with `method: "popup"` and `minutes: 180`. These trigger notifications on the customer's mobile device and desktop Google Calendar app 3 hours prior to the reservation.
+- **Email Notifications:** Configured using `method: "email"` in the reminder overrides. Sends a reminder email directly to the customer's Gmail inbox.
+- **Calendar Event Invitations:** Involves adding attendees to the event (`attendees: [{"email": "..."}]`). Google automatically sends an RSVP invitation email asking the guest to Accept/Decline.
+
+> **Important Delivery Note:** Actual popup delivery depends on the customer's Google Calendar settings, operating system notification permissions, and mobile notification toggles. Aria does not claim an event has been saved unless the Calendar MCP tool execution succeeds.
+
+---
+
+## Reservation Update & Cancellation Synchronization
+
+### 1. Reservation Updates
+When a customer changes date, time, party size, or seating preference:
+- The restaurant reservation is updated via `update_reservation`.
+- If an associated `calendar_event_id` exists, `AgentTools.sync_calendar_on_update()` calls `update_calendar_event` on the Calendar MCP server.
+- The event's start time, end time, and description are updated, **while the 3-hour popup reminder is strictly preserved**.
+
+### 2. Reservation Cancellations
+When a customer cancels a reservation:
+- The restaurant backend marks the reservation status as `cancelled`.
+- If an associated `calendar_event_id` exists, `AgentTools.sync_calendar_on_cancel()` calls `delete_calendar_event` on the Calendar MCP server.
+- The event is removed from the customer's Google Calendar, and `last_confirmed_calendar_event_id` is cleared.
+
+### 3. Failure Independence
+If a calendar update or deletion fails (e.g. Google API rate limits or network issues), **it never rolls back or invalidates the confirmed restaurant reservation**. The customer is simply informed of the calendar sync notice.
+
+---
+
+## Database Schema & Migrations
+
+### 1. PostgreSQL `reservations` Table
+
+The `reservations` table schema in `services/models.py`:
+
+```python
+class Reservation(Base):
+    __tablename__ = "reservations"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    customer_name: Mapped[str] = mapped_column(String(150), nullable=False)
+    customer_phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    customer_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    restaurant_id: Mapped[str] = mapped_column(String(100), nullable=False, default="rest_01")
+    reservation_date: Mapped[date] = mapped_column(Date, nullable=False)
+    reservation_time: Mapped[time] = mapped_column(Time, nullable=False)
+    guest_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    seating_preference: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    special_requests: Mapped[str | None] = mapped_column(Text, nullable=True)
+    table_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="confirmed")
+    hold_token: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    calendar_event_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), onupdate=func.now())
+```
+
+#### Migration for Existing Databases
+If updating an existing PostgreSQL database instance, execute the following SQL:
+
+```sql
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS calendar_event_id VARCHAR(255);
+```
+
+### 2. SQLite OAuth Token Store (`oauth_tokens.db`)
+
+OAuth credentials are kept in a separate, local SQLite database (`oauth_tokens.db`) managed by `services/oauth_store.py`. This ensures token storage remains independent from PostgreSQL and functions identically in mock backend mode.
+
+```sql
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+    session_id    TEXT PRIMARY KEY,
+    access_token  TEXT,
+    refresh_token TEXT,
+    token_expiry  TEXT,
+    google_email  TEXT,
+    created_at    TEXT,
+    updated_at    TEXT
+);
+```
+
+---
+
+## Google Cloud Project & Calendar API Setup
+
+To enable Google Calendar synchronization, set up an OAuth 2.0 Web Application in Google Cloud:
+
+### 1. Create Google Cloud Project
+1. Visit the [Google Cloud Console](https://console.cloud.google.com/).
+2. Click **Select a project** > **New Project**, name it `Araaz Delights`, and click **Create**.
+
+### 2. Enable Google Calendar API
+1. Navigate to **APIs & Services** > **Library**.
+2. Search for `Google Calendar API`.
+3. Select it and click **Enable**.
+
+### 3. Configure OAuth Consent Screen
+1. Go to **APIs & Services** > **OAuth consent screen**.
+2. Select **External** user type and click **Create**.
+3. Fill in the App Name (*The Araaz Delights*), User Support Email, and Developer Contact Information.
+4. Under **Scopes**, click **Add or Remove Scopes** and add:
+   - `https://www.googleapis.com/auth/calendar.events`
+5. Under **Test Users**, add the personal Google email address you will use for testing.
+6. Save and finish.
+
+### 4. Create OAuth Client Credentials
+1. Go to **APIs & Services** > **Credentials**.
+2. Click **Create Credentials** > **OAuth client ID**.
+3. Set Application Type to **Web application**.
+4. Set Name to `Araaz Delights Client`.
+5. Under **Authorized redirect URIs**, add:
+   - `http://localhost:8000/auth/callback`
+6. Click **Create** and copy your **Client ID** and **Client Secret**.
+
+---
+
+## Installation and Environment Configuration
 
 ### 1. Clone the Repository
 
@@ -351,276 +403,128 @@ git clone https://github.com/tabindaai/thearaazdelights-chatbot.git
 cd thearaazdelights-chatbot
 ```
 
-### 2. Create a Virtual Environment
-
-```bash
-python -m venv .venv
-```
-
-Activate it on Windows PowerShell:
+### 2. Create and Activate Virtual Environment
 
 ```powershell
+python -m venv .venv
 .venv\Scripts\Activate.ps1
 ```
 
 ### 3. Install Dependencies
 
-```bash
+```powershell
 pip install -r requirements.txt
 ```
 
-### 4. Configure PostgreSQL
+### 4. Configure Environment Variables
 
-Install and start PostgreSQL.
-
-Create a database named:
-
-```sql
-CREATE DATABASE araaz_delights;
-```
-
-The application uses environment variables to establish the database connection.
-
-### 5. Configure Environment Variables
-
-Create a `.env` file in the project root using `.env.example` as a reference.
-
-Example configuration:
+Create a `.env` file in the project root based on `.env.example`:
 
 ```env
-# Gemini Configuration
-GEMINI_API_KEY=your_gemini_api_key
+# ========================================================
+# Google Gemini API Configuration
+# Get your key from: https://aistudio.google.com/
+# ========================================================
+GEMINI_API_KEY=your_gemini_api_key_here
 GEMINI_MODEL=gemini-3.5-flash-lite
 
-# Backend Selection
-USE_MOCK_BACKEND=false
-
-# PostgreSQL Configuration
-DB_USER=postgres
-DB_PASSWORD=your_database_password
-DB_HOST=localhost
-DB_PORT=5432
-DB_NAME=araaz_delights
-
-# External Restaurant API
-RESTAURANT_API_BASE_URL=http://localhost:8002
+# ========================================================
+# Restaurant Backend Configuration
+# Set USE_MOCK_BACKEND=true for local in-memory development
+# ========================================================
+USE_MOCK_BACKEND=true
+RESTAURANT_API_BASE_URL=http://localhost:8003
 RESTAURANT_API_TIMEOUT_SECONDS=10.0
 
-# MCP Configuration
+# ========================================================
+# Application Settings
+# ========================================================
+FASTAPI_HOST=127.0.0.1
+FASTAPI_PORT=8000
+DEBUG=true
+
+# ========================================================
+# MCP Server Configuration
+# ========================================================
+# Restaurant MCP Server (port 8001)
 MCP_SERVER_URL=http://127.0.0.1:8001/mcp
+
+# Google Calendar MCP Server (port 8002)
+CALENDAR_MCP_SERVER_URL=http://127.0.0.1:8002/mcp
+
+# ========================================================
+# Google Calendar OAuth 2.0 Configuration
+# ========================================================
+GOOGLE_CLIENT_ID=your_client_id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=your_client_secret_here
+GOOGLE_REDIRECT_URI=http://localhost:8000/auth/callback
+CALENDAR_TIMEZONE=Asia/Kolkata
+
+# ========================================================
+# Optional PostgreSQL Database Configuration
+# ========================================================
+DATABASE_URL=postgresql+psycopg://postgres:YOUR_PASSWORD@localhost:5432/araaz_delights
 ```
 
-Alternatively, database configuration can use a `DATABASE_URL` if supported by the deployment environment.
+---
 
-**Important:** Replace the example values with your own configuration. Never commit your actual `.env` file, API keys, or database passwords to GitHub.
+## Running the Complete System
 
-### 6. Create Database Tables
+The system operates across **four modular processes**. Open separate terminals for each:
 
-After configuring PostgreSQL, run:
-
-```powershell
-python create_tables.py
-```
-
-
-This runs the SQLAlchemy schema initialization script.
-It creates the database tables registered in the SQLAlchemy
-models if they do not already exist.
-
-The script uses `Base.metadata.create_all()` from SQLAlchemy.
-
-## Running the Project
-
-The project uses separate processes for the MCP server, FastAPI backend, and Streamlit frontend.
-
-Open separate terminals for the following steps.
-
-### 1. Start the MCP Server
-
+### Terminal 1: Start the Restaurant MCP Server
 ```powershell
 python mcp_server.py
 ```
+*Listens on `http://127.0.0.1:8001/mcp`.*
 
-The MCP server exposes its Streamable HTTP endpoint at:
-
-```text
-http://127.0.0.1:8001/mcp
+### Terminal 2: Start the Google Calendar MCP Server
+```powershell
+python calendar_mcp_server.py
 ```
+*Listens on `http://127.0.0.1:8002/mcp`.*
 
-### 2. Start the FastAPI Backend
-
+### Terminal 3: Start the FastAPI Backend
 ```powershell
 uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ```
+*Listens on `http://127.0.0.1:8000` (Health check: `/health`).*
 
-The FastAPI application runs at:
-
-```text
-http://127.0.0.1:8000
-```
-
-Health check:
-
-```text
-http://127.0.0.1:8000/health
-```
-
-### 3. Start the Streamlit Frontend
-
+### Terminal 4: Start the Streamlit Frontend
 ```powershell
 streamlit run frontend/app.py
 ```
+*Opens chat interface at `http://localhost:8501`.*
 
-The frontend is generally available at:
+---
 
-```text
-http://localhost:8501
+## Testing & Verification
+
+### Run Automated Unit Tests
+
+```powershell
+.venv\Scripts\python.exe -m pytest
 ```
 
-Once all three processes are running, customers can interact with the chatbot through the Streamlit interface.
-
-## Running the MCP Client Demo
-
-A standalone demonstration script is included to test MCP client-server communication independently of the chatbot interface.
-
-Make sure the MCP server is running, then execute:
-
+### Standalone MCP Communication Test
+To test the restaurant MCP server independently:
 ```powershell
 python test_mcp_client.py
 ```
 
-The script demonstrates:
-
-1. Connecting to the MCP server.
-2. Initializing the MCP session.
-3. Discovering available tools.
-4. Executing an MCP tool.
-5. Displaying the returned result.
-
-## Local and Remote MCP Communication
-
-The MCP implementation uses Streamable HTTP, allowing the client and server to run as separate processes and communicate through an HTTP endpoint.
-
-### Local Communication
-
-For local testing:
-
-```env
-MCP_SERVER_URL=http://127.0.0.1:8001/mcp
-```
-
-Start the MCP server locally and run:
-
+### Persistence Verification Test
+To verify reservation persistence across MCP server restarts:
 ```powershell
-python test_mcp_client.py
+python verify_get_reservation.py
 ```
 
-### Remote Communication
+---
 
-The MCP server can also be hosted on another machine.
+## Security Considerations
 
-For remote communication:
-
-1. Start the MCP server on the host machine with an externally accessible network interface.
-2. Ensure that the required port is accessible through the firewall.
-3. Configure the client with the server's reachable URL.
-4. Use appropriate network restrictions and authentication before exposing the service outside a trusted environment.
-
-Example LAN configuration:
-
-```env
-MCP_SERVER_URL=http://192.168.1.42:8001/mcp
-```
-
-A secure tunnel or HTTPS endpoint can be used for communication across different networks.
-
-**Security Note:** The current MCP implementation is intended for development and proof-of-concept use. Do not expose an unauthenticated MCP server publicly. Add authentication, authorization, and appropriate network security before production deployment.
-
-## Testing
-
-Test MCP client-server communication independently using:
-
-```powershell
-python test_mcp_client.py
-```
-
-### Integration Verification
-
-The PostgreSQL and MCP integration has also been manually verified through the application.
-
-The verification covered:
-
-- PostgreSQL connection and reservation table creation.
-- Table availability checking.
-- Reservation creation.
-- Reservation retrieval.
-- Reservation updating.
-- Alternative slot discovery.
-- Reservation cancellation.
-- Retrieval of cancelled reservation records.
-- MCP client connection and tool discovery.
-- Reservation persistence after restarting the MCP server.
-- Mock backend initialization, availability checking, and reservation creation.
-
-The mock backend checks were performed directly through the restaurant API client. The PostgreSQL reservation workflow was tested through the MCP client and `AgentTools`.
-
-### PostgreSQL Persistence Verification After MCP Restart
-
-The persistence test was performed using a separate script:
-`verify_get_reservation.py`.
-
-Verification procedure:
-
-1. Created a reservation using the PostgreSQL backend.
-2. Saved the generated reservation ID.
-3. Restarted the MCP server.
-4. Executed `get_reservation` using the original reservation ID.
-5. Successfully retrieved the original reservation details.
-
-**Result: Successful**
-
-The MCP tool returned `"found": true` and the original
-reservation details, confirming that the reservation remained
-available after the MCP server restarted.
-
-
-## Current Implementation Status
-
-The following functionality has been implemented and verified:
-
-- AI-powered restaurant reservation chatbot.
-- Gemini-based conversational interaction.
-- Session-based conversation memory.
-- Reservation validation and guardrails.
-- FastMCP server exposing seven tools.
-- MCP client using Streamable HTTP.
-- MCP tool discovery and execution.
-- MCP-only communication from `agent/tools.py`.
-- PostgreSQL database integration using SQLAlchemy.
-- Persistent reservation creation and retrieval.
-- Reservation updating and cancellation.
-- Alternative availability suggestions.
-- Mock backend initialization and reservation creation.
-- Confirmed reservation persistence after an MCP server restart.
-
-Cross-machine remote MCP verification and production security hardening remain future deployment tasks.
-
-## Future Improvements
-
-- Complete cross-machine remote MCP testing.
-- Add authentication and authorization for remote MCP communication.
-- Improve error handling, automatic reconnection, and timeout management.
-- Add persistent conversation memory.
-- Improve logging and monitoring for MCP tool execution.
-- Expand automated integration test coverage.
-- Improve handling of ambiguous customer requests.
-- Add production-ready deployment and monitoring.
-- Introduce additional restaurant management tools.
-
-## Conclusion
-
-Araaz Delights demonstrates the integration of conversational AI with a modular backend architecture and the Model Context Protocol.
-
-The project combines Gemini-powered natural language understanding, FastAPI, Streamlit, MCP client-server communication, SQLAlchemy, and PostgreSQL to provide a structured restaurant reservation system.
-
-It also demonstrates how an AI application can discover and execute external tools through a standardized protocol while keeping backend operations separate from conversational logic.
+1. **Least-Privilege Scopes:** The application only requests the narrow `https://www.googleapis.com/auth/calendar.events` scope. It does not request access to contacts, profile data, or Gmail.
+2. **Server-Side Token Storage:** Access and refresh tokens are stored exclusively in the server-side SQLite token database. Tokens are never transmitted to the Streamlit frontend.
+3. **No Password Prompting:** Aria will never ask customers for their Google passwords. All authentication occurs on Google's official sign-in page.
+4. **Log Sanitization:** Sensitive tokens, client secrets, and user credentials are scrubbed from structured log outputs.
+5. **CSRF State Validation:** OAuth 2.0 authorization codes are bound to single-use cryptographically random `state` parameters to protect against cross-site request forgery.
+6. **Graceful Degeneration:** A failure in Google Calendar communication never causes data loss in the restaurant reservation system.

@@ -194,6 +194,10 @@ class Guardrails:
         if Guardrails.is_closing_message(message):
             return False
 
+        # Always allow affirmative booking confirmations
+        if Guardrails.is_affirmative_confirmation(message):
+            return False
+
         # Simple acknowledgements and short conversational responses
         simple_responses = [
             "hi", "hello", "hey", "hii", "namaste", "namaskar",
@@ -232,7 +236,8 @@ class Guardrails:
             "reserve a table", "table for",
             "party size", "number of guests",
             "available tables", "booking details",
-            "reservation details",
+            "reservation details", "email", "email address",
+            "my email", "calendar", "google calendar",
         ]
 
         # Check reservation-related keywords
@@ -256,19 +261,32 @@ class Guardrails:
             r"[-/\s]\d{2,4})\b"
         )
 
-        # Time input support
+        # Time input support (e.g., "1pm", "1:00 PM", "13:00", "12", "12pm'", "at 6")
         time_pattern = (
             r"\b(?:1[0-2]|0?[1-9])(?::[0-5]\d)?\s?(?:am|pm)\b"
             r"|\b(?:[01]?\d|2[0-3]):[0-5]\d\b"
         )
+        time_expression_pattern = (
+            r"^\s*(?:at\s+)?(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(?:am|pm)?['.]?\s*$"
+        )
 
-        if re.search(natural_date_pattern, message) or re.search(time_pattern, message):
+        if (
+            re.search(natural_date_pattern, message)
+            or re.search(time_pattern, message)
+            or re.search(time_expression_pattern, message, re.IGNORECASE)
+        ):
+            return False
+
+        # Email input support (always on-topic)
+        email_pattern = r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b"
+        if re.search(email_pattern, message):
             return False
 
         # Context-aware reservation detail collection across all detail-gathering states
         detail_gathering_states = (
             ConversationState.COLLECTING_DETAILS,
             ConversationState.SLOT_AVAILABLE,
+            ConversationState.SLOT_UNAVAILABLE,
             ConversationState.CHECKING_AVAILABILITY,
         )
         if session and session.state in detail_gathering_states:
@@ -288,18 +306,23 @@ class Guardrails:
                 return True
 
             # Allow short answers that may represent reservation details
-            # such as a customer's name or a simple detail.
+            # such as a customer's name, requested time, or party size.
             missing_fields = session.draft.missing_fields_for_booking()
 
-            if missing_fields and len(message.split()) <= 8 and len(message) <= 80:
+            if (missing_fields or session.state == ConversationState.SLOT_UNAVAILABLE) and len(message.split()) <= 8 and len(message) <= 80:
                 # Accept simple name-like or detail-like responses.
                 simple_answer_pattern = r"^[a-zA-Z][a-zA-Z\s.'-]*$"
 
                 if re.match(simple_answer_pattern, message.strip()):
                     return False
 
-                # Accept numeric guest counts or phone-number-like answers.
-                if re.fullmatch(r"[\d\s+\-()]+", message.strip()):
+                # Accept numeric hour, guest counts, or phone-number-like answers.
+                if re.fullmatch(r"[\d\s+\-()']+", message.strip()):
+                    return False
+
+                # Accept email address patterns as valid reservation detail answers.
+                email_pattern = r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b"
+                if re.search(email_pattern, message):
                     return False
 
         return True
@@ -322,22 +345,30 @@ class Guardrails:
         Ensures date is valid and not in the past.
         Expected format: YYYY-MM-DD
         """
-        try:
-            target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-            today = date.today()
+        if not date_str or not date_str.strip():
+            return False, "Please provide a valid reservation date."
 
-            if target_date < today:
-                return False, (
-                    f"Reservation date cannot be in the past ({date_str}). "
-                    "Please select today or a future date."
-                )
+        target_date = None
+        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%Y", "%d-%b-%Y", "%d %b %Y", "%d %B %Y"):
+            try:
+                target_date = datetime.strptime(date_str.strip(), fmt).date()
+                break
+            except ValueError:
+                continue
 
-            return True, "Valid date"
-
-        except ValueError:
+        if not target_date:
             return False, (
                 f"Invalid date format '{date_str}'. Expected YYYY-MM-DD."
             )
+
+        today = date.today()
+        if target_date < today:
+            return False, (
+                f"Reservation date cannot be in the past ({date_str}). "
+                "Please select today or a future date."
+            )
+
+        return True, "Valid date"
 
     @staticmethod
     def validate_guest_count(count: int) -> Tuple[bool, str]:
@@ -368,6 +399,22 @@ class Guardrails:
             )
 
         return True, "Valid phone"
+
+    @staticmethod
+    def validate_email(email_str: Optional[str]) -> Tuple[bool, str]:
+        """Validates customer email address format. Email is required for reservation and Google Calendar reminder."""
+        if not email_str or not email_str.strip():
+            return False, "Please provide your email address."
+
+        pattern = re.compile(
+            r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$"
+        )
+        if not pattern.match(email_str.strip()):
+            return False, (
+                "Please provide a valid email address (e.g., name@example.com)."
+            )
+
+        return True, "Valid email"
 
     # ------------------------------------------------------------------------
     # 3. CONFIRMATION DETECTION & TOOL EXECUTION GATE
@@ -401,6 +448,7 @@ class Guardrails:
             r"\b(pm|am|\d{1,2}:\d{2}|\d+\s*(people|guests|persons))\b",
             r"\b(bye|goodbye|see you|take care|that's all|thats all|nothing else|nothing more)\b",
             r"\b(thank you|thanks|thank u)\b",
+            r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b",
         ]
 
         if any(re.search(pattern, cleaned) for pattern in disqualifiers):
@@ -472,9 +520,9 @@ class Guardrails:
                 "How can I assist you with your booking?"
             )
 
-        # Mask internal endpoints and credentials
+        # Mask internal endpoints and credentials (allow user-facing OAuth authorization link)
         redacted = re.sub(
-            r"https?://localhost:\d+",
+            r"https?://(?:localhost|127\.0\.0\.1):\d+(?!/auth/google)",
             "[internal-service]",
             response_text
         )

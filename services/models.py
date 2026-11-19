@@ -103,3 +103,8 @@ class Reservation(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+    calendar_event_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )

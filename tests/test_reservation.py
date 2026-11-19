@@ -14,6 +14,7 @@ Covers all 9 required debugging scenarios:
 """
 
 import asyncio
+from datetime import date, timedelta
 import pytest
 from main import health_check, chat_endpoint, reset_session
 from schemas.chat import ChatRequest
@@ -22,6 +23,24 @@ from agent.memory import memory_manager, SessionMemory, ConversationState
 from agent.tools import AgentTools
 from agent.chatbot import chatbot_agent
 from services.restaurant_api import RestaurantAPIClient
+
+# Dynamic future date for tests
+FUTURE_DATE = (date.today() + timedelta(days=7)).strftime("%Y-%m-%d")
+
+
+@pytest.fixture(autouse=True)
+def clean_test_db():
+    """Ensure clean database state before each test run."""
+    try:
+        from services.db import SessionLocal
+        from sqlalchemy import text
+        s = SessionLocal()
+        s.execute(text("DELETE FROM reservations WHERE customer_name IN ('Tabinda', 'Fayaz', 'Zainab', 'Sarah', 'Imran', 'Kiran', 'Alice', 'Bob', 'David', 'CapacityBlocker')"))
+        s.commit()
+        s.close()
+    except Exception:
+        pass
+    yield
 
 
 # ----------------------------------------------------------------------------
@@ -63,14 +82,15 @@ def test_scenario_1_normal_booking():
     # 1. Customer provides details
     tools.update_reservation_details(
         name="Tabinda",
-        date="2026-11-10",
+        email="tabinda@example.com",
+        date=FUTURE_DATE,
         time="18:00",
         guest_count=4,
         seating_preference="indoor",
     )
     # 2. Check availability
     avail = tools.check_table_availability(
-        reservation_date="2026-11-10",
+        reservation_date=FUTURE_DATE,
         reservation_time="18:00",
         guest_count=4,
         seating_preference="indoor",
@@ -99,8 +119,8 @@ def test_scenario_2_repeated_confirmation():
     tools = AgentTools(session)
 
     # Set up ready state
-    tools.update_reservation_details(name="Fayaz", date="2026-11-12", time="19:00", guest_count=2)
-    tools.check_table_availability("2026-11-12", "19:00", 2)
+    tools.update_reservation_details(name="Fayaz", email="fayaz@example.com", date=FUTURE_DATE, time="17:00", guest_count=2)
+    tools.check_table_availability(FUTURE_DATE, "17:00", 2)
     assert session.state == ConversationState.AWAITING_CUSTOMER_CONFIRMATION
 
     # First confirmation
@@ -124,8 +144,8 @@ def test_scenario_3_changed_time():
     session.reset()
     tools = AgentTools(session)
 
-    tools.update_reservation_details(name="Zainab", date="2026-11-14", time="18:00", guest_count=4)
-    tools.check_table_availability("2026-11-14", "18:00", 4)
+    tools.update_reservation_details(name="Zainab", email="zainab@example.com", date=FUTURE_DATE, time="18:00", guest_count=4)
+    tools.check_table_availability(FUTURE_DATE, "18:00", 4)
     session.draft.confirmed_by_customer = True
     assert session.draft.is_ready_for_booking() is True
 
@@ -136,7 +156,7 @@ def test_scenario_3_changed_time():
     assert session.draft.hold_token is None
 
     # Availability must be checked for 4 PM
-    avail_4pm = tools.check_table_availability("2026-11-14", "16:00", 4)
+    avail_4pm = tools.check_table_availability(FUTURE_DATE, "16:00", 4)
     assert avail_4pm["available"] is True
     assert session.state == ConversationState.AWAITING_CUSTOMER_CONFIRMATION
 
@@ -152,15 +172,15 @@ def test_scenario_4_unrelated_message_does_not_recheck_availability():
     tools = AgentTools(session)
 
     # Date, time, guests checked first
-    tools.update_reservation_details(date="2026-11-15", time="20:00", guest_count=3)
-    tools.check_table_availability("2026-11-15", "20:00", 3)
+    tools.update_reservation_details(date=FUTURE_DATE, time="20:00", guest_count=3, email="sarah@example.com")
+    tools.check_table_availability(FUTURE_DATE, "20:00", 3)
     initial_check = session.last_availability_result
     assert initial_check is not None
 
     # Customer provides name
     tools.update_reservation_details(name="Sarah")
     # Re-checking with same parameters should return the exact cached result without hitting backend
-    subsequent_check = tools.check_table_availability("2026-11-15", "20:00", 3)
+    subsequent_check = tools.check_table_availability(FUTURE_DATE, "20:00", 3)
     assert subsequent_check == initial_check
     assert session.state == ConversationState.AWAITING_CUSTOMER_CONFIRMATION
 
@@ -175,11 +195,11 @@ def test_scenario_5_optional_phone_number():
     session.reset()
     tools = AgentTools(session)
 
-    tools.update_reservation_details(name="Imran", date="2026-11-16", time="19:30", guest_count=2)
+    tools.update_reservation_details(name="Imran", email="imran@example.com", date=FUTURE_DATE, time="19:30", guest_count=2)
     assert session.draft.customer_phone is None
     assert len(session.draft.missing_fields_for_booking()) == 0
 
-    tools.check_table_availability("2026-11-16", "19:30", 2)
+    tools.check_table_availability(FUTURE_DATE, "19:30", 2)
     # Confirm
     reply, state, res_id = asyncio.run(chatbot_agent.process_message(session_id, "Sure, confirm it"))
     assert state == ConversationState.RESERVATION_CONFIRMED.value
@@ -197,7 +217,20 @@ def test_scenario_6_unavailable_table_offers_alternatives():
     session.reset()
     tools = AgentTools(session)
 
-    res = tools.check_table_availability("2026-11-10", "21:00", 4)
+    res = tools.check_table_availability(
+        FUTURE_DATE,
+        "21:00",
+        4,
+        mcp_result={
+            "available": False,
+            "hold_token": None,
+            "message": "No tables available at this time.",
+            "alternatives": [
+                {"date": FUTURE_DATE, "time": "19:30", "available": True},
+                {"date": FUTURE_DATE, "time": "21:45", "available": True},
+            ],
+        },
+    )
     assert res["available"] is False
     assert len(res["suggested_alternatives"]) > 0
     assert session.state == ConversationState.SLOT_UNAVAILABLE
@@ -213,15 +246,17 @@ def test_scenario_7_booking_failure_handling():
     session.reset()
     tools = AgentTools(session)
 
-    tools.update_reservation_details(name="Kiran", date="2026-11-20", time="19:00", guest_count=2)
-    tools.check_table_availability("2026-11-20", "19:00", 2)
+    tools.update_reservation_details(name="Kiran", email="kiran@example.com", date=FUTURE_DATE, time="19:00", guest_count=2)
+    tools.check_table_availability(FUTURE_DATE, "19:00", 2)
     session.draft.confirmed_by_customer = True
 
     # Temporarily simulate backend failure by pointing to non-existent server
     client = RestaurantAPIClient(base_url="http://localhost:9999", use_mock=False)
     req = ReservationCreateRequest(
+        hold_token="HOLD-TEST-FAIL",
         customer_name="Kiran",
-        reservation_date="2026-11-20",
+        customer_email="kiran@example.com",
+        reservation_date=FUTURE_DATE,
         reservation_time="19:00",
         guest_count=2,
     )
@@ -243,8 +278,8 @@ def test_scenario_8_session_isolation():
     tools_a = AgentTools(session_a)
     tools_b = AgentTools(session_b)
 
-    tools_a.update_reservation_details(name="Alice", guest_count=2, date="2026-11-18", time="18:00")
-    tools_b.update_reservation_details(name="Bob", guest_count=8, date="2026-11-25", time="20:00")
+    tools_a.update_reservation_details(name="Alice", guest_count=2, date=FUTURE_DATE, time="18:00")
+    tools_b.update_reservation_details(name="Bob", guest_count=8, date=FUTURE_DATE, time="20:00")
 
     assert session_a.draft.customer_name == "Alice"
     assert session_a.draft.guest_count == 2
@@ -262,8 +297,8 @@ def test_scenario_9_duplicate_booking_protection():
     session.reset()
     tools = AgentTools(session)
 
-    tools.update_reservation_details(name="David", date="2026-11-22", time="19:00", guest_count=4)
-    tools.check_table_availability("2026-11-22", "19:00", 4)
+    tools.update_reservation_details(name="David", email="david@example.com", date=FUTURE_DATE, time="19:00", guest_count=4)
+    tools.check_table_availability(FUTURE_DATE, "19:00", 4)
     session.draft.confirmed_by_customer = True
 
     # 1. First booking

@@ -87,6 +87,12 @@ if "current_state" not in st.session_state:
 if "reservation_id" not in st.session_state:
     st.session_state.reservation_id = None
 
+if "google_calendar_authorized" not in st.session_state:
+    st.session_state.google_calendar_authorized = False
+
+if "google_calendar_email" not in st.session_state:
+    st.session_state.google_calendar_email = None
+
 
 # ============================================================================
 # BACKEND COMMUNICATION HELPERS
@@ -149,6 +155,63 @@ def reset_conversation():
     ]
 
 
+def check_calendar_auth_status() -> dict:
+    """Check Google Calendar authorization status from FastAPI backend."""
+    try:
+        res = requests.get(
+            f"{FASTAPI_URL}/auth/status/{st.session_state.session_id}",
+            timeout=3.0
+        )
+        if res.status_code == 200:
+            return res.json()
+    except Exception:
+        pass
+    return {"google_calendar_authorized": False, "google_email": None, "has_stored_tokens": False}
+
+
+def disconnect_google_calendar():
+    """Disconnect Google Calendar via FastAPI backend."""
+    try:
+        requests.post(
+            f"{FASTAPI_URL}/auth/disconnect/{st.session_state.session_id}",
+            timeout=3.0
+        )
+    except Exception:
+        pass
+    st.session_state.google_calendar_authorized = False
+    st.session_state.google_calendar_email = None
+
+
+# Process OAuth callback redirect parameters
+_query_params = st.query_params
+
+if "oauth_success" in _query_params:
+    auth_info = check_calendar_auth_status()
+    st.session_state.google_calendar_authorized = auth_info.get("google_calendar_authorized", False)
+    st.session_state.google_calendar_email = auth_info.get("google_email")
+    st.toast("🎉 Google Calendar connected successfully!", icon="📅")
+    st.query_params.clear()
+
+elif "oauth_error" in _query_params:
+    err_code = _query_params.get("oauth_error", "unknown")
+    detail = _query_params.get("oauth_detail", "")
+    err_msgs = {
+        "cancelled": "Google Calendar authorization was cancelled.",
+        "invalid_state": "Authorization session expired or was invalid. Please try again.",
+        "exchange_failed": "Could not connect to Google Calendar. Please check your credentials.",
+    }
+    base_msg = err_msgs.get(err_code, "Calendar authorization failed.")
+    full_msg = f"{base_msg} (Details: {detail})" if detail else base_msg
+    st.error(f"⚠️ {full_msg}")
+    st.query_params.clear()
+
+if not st.session_state.google_calendar_authorized:
+    _initial_status = check_calendar_auth_status()
+    if _initial_status.get("google_calendar_authorized"):
+        st.session_state.google_calendar_authorized = True
+        st.session_state.google_calendar_email = _initial_status.get("google_email")
+
+
 # ============================================================================
 # SIDEBAR
 # ============================================================================
@@ -180,6 +243,23 @@ with st.sidebar:
     if st.button("🔄 Start New Conversation", use_container_width=True):
         reset_conversation()
         st.rerun()
+
+    st.divider()
+
+    # Google Calendar Integration Section
+    st.markdown("### 📅 Google Calendar")
+    if st.session_state.google_calendar_authorized:
+        user_acc = st.session_state.google_calendar_email or "Authorized Google Account"
+        st.success(f"**Connected**\n\n`{user_acc}`", icon="✅")
+        st.caption("Reservations will automatically sync with a 3-hour reminder.")
+        if st.button("🔌 Disconnect Calendar", use_container_width=True):
+            disconnect_google_calendar()
+            st.rerun()
+    else:
+        st.info("Sync bookings to your Google Calendar and receive a reminder 3 hours before.", icon="📅")
+        auth_link = f"{FASTAPI_URL}/auth/google?session_id={st.session_state.session_id}"
+        st.link_button("🔗 Connect Google Calendar", auth_link, use_container_width=True)
+        st.caption("Optional. Table reservations work without it.")
 
     st.markdown("---")
     st.markdown(

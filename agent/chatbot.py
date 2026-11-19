@@ -40,12 +40,15 @@ class RestaurantChatbotAgent:
     def __init__(self, api_key: Optional[str] = None, model: str = GEMINI_MODEL):
         self.api_key = api_key or GEMINI_API_KEY
         self.model = model
+        self._client: Optional[genai.Client] = None
 
     def _get_genai_client(self) -> Optional[genai.Client]:
-        """Instantiate official GenAI client if a valid key exists."""
+        """Instantiate official GenAI client if a valid key exists, reusing connection pool."""
         if not self.api_key or self.api_key == "your_gemini_api_key_here":
             return None
-        return genai.Client(api_key=self.api_key)
+        if self._client is None:
+            self._client = genai.Client(api_key=self.api_key)
+        return self._client
 
     async def process_message(self, session_id: str, user_message: str) -> Tuple[str, str, Optional[str]]:
         """
@@ -59,6 +62,23 @@ class RestaurantChatbotAgent:
 
         if not is_valid:
             return error_msg, session.state.value, session.last_confirmed_reservation_id
+
+        # Fast greeting response for pure greetings without booking details (< 5ms response time)
+        norm_greeting = sanitized_text.lower().strip().rstrip("!.,? ")
+        pure_greetings = {"hi", "hii", "hello", "hey", "namaste", "good morning", "good afternoon", "good evening"}
+        if (
+            session.state == ConversationState.START
+            and norm_greeting in pure_greetings
+            and not session.draft.reservation_date
+            and not session.draft.guest_count
+        ):
+            greeting_reply = (
+                "Hello! Welcome to The Araaz Delights. I am Aria, your AI Reservation Concierge. "
+                "How may I assist you with your table booking today?"
+            )
+            session.add_user_message(sanitized_text)
+            session.add_model_message(greeting_reply)
+            return greeting_reply, session.state.value, session.last_confirmed_reservation_id
        
         
 
@@ -84,7 +104,7 @@ class RestaurantChatbotAgent:
                 "my reservation details",
             ]
 
-            if any(phrase in message for phrase in status_phrases):
+            if any(phrase in message for phrase in status_phrases) or Guardrails.is_affirmative_confirmation(sanitized_text):
                 already_booked_reply = (
                     f"Your reservation is already confirmed!\n\n"
                     f"**Reservation ID:** `{session.last_confirmed_reservation_id}`\n"
@@ -116,18 +136,48 @@ class RestaurantChatbotAgent:
 
             if booking_result.get("status") == "confirmed":
                 res_id = booking_result["reservation_id"]
+                email_line = f"**Email:** {session.draft.customer_email}\n" if session.draft.customer_email else ""
                 phone_line = f"**Contact Phone:** {session.draft.customer_phone}\n" if session.draft.customer_phone else ""
                 special_line = f"**Special Requests:** {session.draft.special_requests}\n" if session.draft.special_requests else ""
+
+                # Automatic Google Calendar Sync via unified MCP Client
+                calendar_line = ""
+                if session.google_calendar_authorized:
+                    try:
+                        cal_res = tools_instance.save_to_google_calendar()
+                        if cal_res.get("success"):
+                            mismatch = (
+                                session.authorized_google_email
+                                and session.draft.customer_email
+                                and session.authorized_google_email.lower().strip() != session.draft.customer_email.lower().strip()
+                            )
+                            account_detail = f" (saved to connected Google account: `{session.authorized_google_email}`)" if mismatch else ""
+                            calendar_line = f"📅 **Google Calendar:** Saved to your calendar{account_detail} with a reminder 3 hours (180 min) before!\n"
+                        else:
+                            calendar_line = f"📅 **Google Calendar:** Note: {cal_res.get('message', 'Could not sync with Google Calendar')}\n"
+                    except Exception as cal_err:
+                        logger.warning(f"Calendar sync exception: {cal_err}")
+                        calendar_line = "📅 **Google Calendar:** Could not save calendar event at this time.\n"
+                else:
+                    fastapi_host = os.getenv("FASTAPI_HOST", "127.0.0.1")
+                    fastapi_port = os.getenv("FASTAPI_PORT", "8000")
+                    auth_url = f"http://{fastapi_host}:{fastapi_port}/auth/google?session_id={session_id}"
+                    calendar_line = (
+                        f"💡 **Google Calendar Reminder:** [🔗 Connect Google Calendar]({auth_url}) "
+                        f"to automatically sync your reservation with a 3-hour reminder.\n"
+                    )
 
                 confirmation_reply = (
                     f"Wonderful! Your reservation has been officially confirmed!\n\n"
                     f"**Reservation ID:** `{res_id}`\n"
                     f"**Guest Name:** {session.draft.customer_name}\n"
+                    f"{email_line}"
                     f"**Date:** {session.draft.reservation_date}\n"
                     f"**Time:** {session.draft.reservation_time}\n"
                     f"**Party Size:** {session.draft.guest_count} guests\n"
                     f"{phone_line}"
                     f"{special_line}\n"
+                    f"{calendar_line}\n"
                     f"We look forward to welcoming you to The Araaz Delights! Please let me know if you need anything else."
                 )
                 session.add_user_message(sanitized_text)
@@ -153,37 +203,64 @@ class RestaurantChatbotAgent:
                 session.last_confirmed_reservation_id
             )
 
-        # 4. Context-aware customer name extraction if the assistant requested customer's name
-        if not session.draft.customer_name and session.state in (
-            ConversationState.SLOT_AVAILABLE,
-            ConversationState.COLLECTING_DETAILS,
-        ):
-            clean = sanitized_text.strip()
-            name_match = re.match(
-                r"^(?:my name is|i am|i'm|this is|it's|name is)?\s*([a-zA-Z][a-zA-Z\s.'-]{1,40})$",
-                clean,
-                re.IGNORECASE,
-            )
-            if name_match:
-                candidate_name = name_match.group(1).strip()
-                disqualified = {
-                    "hello", "hi", "hey", "hii", "namaste", "bye", "goodbye",
-                    "yes", "yeah", "yep", "no", "nope", "okay", "ok", "sure",
-                    "table", "reservation", "booking", "tomorrow", "today", "tonight",
-                    "thanks", "thank you", "alright", "fine"
+        # 4. Context-aware extraction of details directly from customer input
+        clean = sanitized_text.strip()
+
+        # 4.1 Auto-extract email address if present in message
+        email_match = re.search(r"\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b", clean)
+        if email_match and not session.draft.customer_email:
+            extracted_email = email_match.group(1).lower()
+            logger.info(f"Auto-extracted customer email '{extracted_email}' for session '{session_id}'")
+            session.draft.customer_email = extracted_email
+            if session.draft.has_required_booking_fields() and session.draft.hold_token:
+                session.set_state(ConversationState.AWAITING_CUSTOMER_CONFIRMATION)
+
+        # 4.2 Auto-extract customer name
+        if not session.draft.customer_name:
+            # Check for introductory phrases like "i am [Name]" or "my name is [Name]"
+            name_intro = re.search(r"\b(?:my name is|i am|i'm)\s+([a-zA-Z]{2,25})\b", clean, re.IGNORECASE)
+            if name_intro:
+                cand = name_intro.group(1).strip()
+                disqualified_intro = {
+                    "a", "an", "the", "looking", "trying", "here", "ready", "interested",
+                    "wondering", "asking", "calling", "fine", "good", "happy", "sorry",
+                    "booking", "table"
                 }
-                words = candidate_name.lower().split()
-                if not any(w in disqualified for w in words) and len(words) <= 4:
-                    last_bot_msg = ""
-                    for m in reversed(session.history):
-                        if m.get("role") == "model":
-                            last_bot_msg = m["parts"][0]["text"].lower()
-                            break
-                    if "name" in last_bot_msg or session.state == ConversationState.SLOT_AVAILABLE:
-                        logger.info(f"Auto-extracted customer name '{candidate_name.title()}' for session '{session_id}'")
-                        session.draft.customer_name = candidate_name.title()
-                        if session.draft.has_required_booking_fields() and session.draft.hold_token:
-                            session.set_state(ConversationState.AWAITING_CUSTOMER_CONFIRMATION)
+                if cand.lower() not in disqualified_intro:
+                    session.draft.customer_name = cand.title()
+                    logger.info(f"Auto-extracted customer name '{cand.title()}' from introduction for session '{session_id}'")
+                    if session.draft.has_required_booking_fields() and session.draft.hold_token:
+                        session.set_state(ConversationState.AWAITING_CUSTOMER_CONFIRMATION)
+
+            elif session.state in (
+                ConversationState.SLOT_AVAILABLE,
+                ConversationState.COLLECTING_DETAILS,
+            ):
+                name_match = re.match(
+                    r"^(?:this is|it's|name is)?\s*([a-zA-Z][a-zA-Z\s.'-]{1,40})$",
+                    clean,
+                    re.IGNORECASE,
+                )
+                if name_match:
+                    candidate_name = name_match.group(1).strip()
+                    disqualified = {
+                        "hello", "hi", "hey", "hii", "namaste", "bye", "goodbye",
+                        "yes", "yeah", "yep", "no", "nope", "okay", "ok", "sure",
+                        "table", "reservation", "booking", "tomorrow", "today", "tonight",
+                        "thanks", "thank you", "alright", "fine"
+                    }
+                    words = candidate_name.lower().split()
+                    if not any(w in disqualified for w in words) and len(words) <= 4:
+                        last_bot_msg = ""
+                        for m in reversed(session.history):
+                            if m.get("role") == "model":
+                                last_bot_msg = m["parts"][0]["text"].lower()
+                                break
+                        if "name" in last_bot_msg or session.state == ConversationState.SLOT_AVAILABLE:
+                            logger.info(f"Auto-extracted customer name '{candidate_name.title()}' for session '{session_id}'")
+                            session.draft.customer_name = candidate_name.title()
+                            if session.draft.has_required_booking_fields() and session.draft.hold_token:
+                                session.set_state(ConversationState.AWAITING_CUSTOMER_CONFIRMATION)
 
         # 5. Update Session History with user message
         session.add_user_message(sanitized_text)
@@ -289,6 +366,10 @@ class RestaurantChatbotAgent:
                 special_requests=special_requests or None,
             )
 
+        def save_to_google_calendar() -> Dict[str, Any]:
+            """Save the current confirmed reservation to the customer's authorized Google Calendar with a 3-hour reminder."""
+            return tools_instance.save_to_google_calendar()
+
         # 5. Build Dynamic System Prompt with current runtime state
         system_instruction = build_system_prompt(session)
 
@@ -302,6 +383,7 @@ class RestaurantChatbotAgent:
                 get_reservation_details,
                 cancel_existing_reservation,
                 update_confirmed_reservation,
+                save_to_google_calendar,
             ]
 
             # Build message history for Gemini SDK
@@ -320,18 +402,50 @@ class RestaurantChatbotAgent:
                 system_instruction=system_instruction,
                 tools=available_tools,
                 temperature=0.2,
+                max_output_tokens=600,
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(
                     disable=False,
                     maximum_remote_calls=5,
                 ),
             )
 
-            # Generate content using google-genai
-            response = client.models.generate_content(
-                model=self.model,
-                contents=contents,
-                config=config,
-            )
+            # Candidate models for high availability and load resilience
+            candidate_models = [self.model]
+            for m in ("gemini-3.1-flash-lite", "gemini-3.5-flash-lite"):
+                if m not in candidate_models:
+                    candidate_models.append(m)
+
+            response = None
+            last_exc = None
+
+            for model_name in candidate_models:
+                for attempt in range(2):
+                    try:
+                        response = client.models.generate_content(
+                            model=model_name,
+                            contents=contents,
+                            config=config,
+                        )
+                        if response:
+                            break
+                    except Exception as err:
+                        last_exc = err
+                        err_str = str(err)
+                        # Check for transient server spikes (503 UNAVAILABLE / 429 Resource Exhausted)
+                        if any(marker in err_str for marker in ("503", "429", "UNAVAILABLE", "high demand")):
+                            logger.warning(
+                                f"Transient demand spike on model '{model_name}' (attempt {attempt+1}/2): {err}. "
+                                f"Waiting 1.0s before retrying..."
+                            )
+                            await asyncio.sleep(1.0)
+                            continue
+                        logger.warning(f"Model '{model_name}' attempt failed: {err}. Trying next candidate...")
+                        break
+                if response:
+                    break
+
+            if not response:
+                raise last_exc or RuntimeError("All Gemini model candidates failed to respond.")
 
             raw_reply = response.text or "I have processed your request. How else may I assist you?"
 

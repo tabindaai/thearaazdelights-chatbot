@@ -80,6 +80,7 @@ class ReservationDetails(BaseModel):
     table_number: Optional[int] = None
     status: str = "confirmed"
     hold_token: Optional[str] = None
+    calendar_event_id: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

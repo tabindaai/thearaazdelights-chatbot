@@ -13,6 +13,7 @@ the restaurant backend service rather than the chatbot layer.
 
 import logging
 import os
+import re
 import secrets
 import threading
 
@@ -53,7 +54,7 @@ USE_MOCK = (
 
 BASE_URL = os.getenv(
     "RESTAURANT_API_BASE_URL",
-    "http://localhost:8002",
+    "http://localhost:8003",
 ).rstrip("/")
 
 TIMEOUT_SECONDS = float(
@@ -110,11 +111,49 @@ class RestaurantAPIClient:
 
     @staticmethod
     def _parse_date(value: str) -> date:
-        return date.fromisoformat(value)
+        if isinstance(value, date):
+            return value
+        val = str(value).strip()
+        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%Y", "%d-%b-%Y", "%d %b %Y", "%d %B %Y"):
+            try:
+                return datetime.strptime(val, fmt).date()
+            except ValueError:
+                continue
+        return date.fromisoformat(val)
 
     @staticmethod
     def _parse_time(value: str) -> time:
-        return time.fromisoformat(value)
+        if isinstance(value, time):
+            return value
+        val = str(value).strip().lower().rstrip("'.")
+        # Standard ISO format (HH:MM or HH:MM:SS)
+        try:
+            return time.fromisoformat(val)
+        except ValueError:
+            pass
+        # 12-hour and 24-hour strptime formats
+        for fmt in ("%I:%M %p", "%I:%M%p", "%I %p", "%I%p", "%H:%M", "%H:%M:%S"):
+            try:
+                return datetime.strptime(val.upper(), fmt).time()
+            except ValueError:
+                pass
+        # Regex matching for patterns like "1pm", "3:30pm", "12am", "6pm"
+        m = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$", val, re.IGNORECASE)
+        if m:
+            hr = int(m.group(1))
+            mn = int(m.group(2) or 0)
+            ampm = m.group(3).lower()
+            if ampm == "pm" and hr < 12:
+                hr += 12
+            elif ampm == "am" and hr == 12:
+                hr = 0
+            return time(hr, mn)
+        # Standalone hour integer (e.g. "12", "13", "18")
+        if val.isdigit():
+            hr = int(val)
+            if 0 <= hr <= 23:
+                return time(hr, 0)
+        raise ValueError(f"Invalid time format '{value}'. Expected HH:MM or 12-hour format.")
 
     @staticmethod
     def _format_time(value: time) -> str:
@@ -138,6 +177,7 @@ class RestaurantAPIClient:
             table_number=booking.table_number,
             status=booking.status,
             hold_token=booking.hold_token,
+            calendar_event_id=getattr(booking, "calendar_event_id", None),
             created_at=booking.created_at,
             updated_at=booking.updated_at,
         )

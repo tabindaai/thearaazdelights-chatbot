@@ -9,6 +9,8 @@ __pycache__/
 
 # Environment variables & secrets
 .env
+*.db
+oauth_tokens.db
 
 # VS Code & IDE settings
 .vscode/
@@ -16,4 +18,9 @@ __pycache__/
 
 # Streamlit runtime
 .streamlit/
+
+# Logs and OS files
+*.log
+.DS_Store
+Thumbs.db
 

@@ -55,19 +55,28 @@ def test_slot_unavailable_returns_alternatives():
 
 def test_tool_check_availability_updates_state():
     """Verify tool execution transitions session state from START -> CHECKING -> SLOT_AVAILABLE."""
+    from datetime import date, timedelta
+    target_date = (date.today() + timedelta(days=5)).strftime("%Y-%m-%d")
+
     session = SessionMemory(session_id="avail_test")
     tools = AgentTools(session)
 
     res = tools.check_table_availability(
-        reservation_date="2026-11-12",
+        reservation_date=target_date,
         reservation_time="18:30",
         guest_count=2,
         seating_preference="outdoor",
+        mcp_result={
+            "available": True,
+            "hold_token": "HOLD-TEST-123",
+            "message": "Table available for 2 guests.",
+            "alternatives": [],
+        },
     )
 
     assert res["available"] is True
     assert session.state == ConversationState.SLOT_AVAILABLE
-    assert session.draft.reservation_date == "2026-11-12"
+    assert session.draft.reservation_date == target_date
     assert session.draft.guest_count == 2
     assert session.draft.seating_preference == "outdoor"
 
@@ -84,9 +93,11 @@ def test_capacity_limit_makes_slot_unavailable():
     from schemas.reservation import ReservationCreateRequest
     booking_req = ReservationCreateRequest(
         customer_name="Tabinda",
+        customer_email="tabinda@example.com",
         reservation_date="2026-11-15",
         reservation_time="16:00",
         guest_count=20,
+        hold_token="HOLD-TABINDA-20",
     )
     booked = client.create_reservation(booking_req)
     assert booked.status == "confirmed"

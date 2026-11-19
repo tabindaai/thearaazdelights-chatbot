@@ -41,8 +41,12 @@ def test_gradual_information_collection():
     assert draft.reservation_date == "2026-11-10"
     assert draft.customer_name == "Tabinda"  # Still remembered!
 
-    # Turn 3: Customer provides time (no phone)
+    # Turn 3: Customer provides time
     draft.update_field("reservation_time", "19:30")
+    assert "your email address" in draft.missing_fields_for_booking()
+
+    # Turn 4: Customer provides email address
+    draft.update_field("customer_email", "tabinda@example.com")
     assert len(draft.missing_fields_for_booking()) == 0  # All mandatory fields present without phone!
 
     # Customer optionally provides phone
@@ -62,6 +66,7 @@ def test_stale_confirmation_invalidation_on_change():
     """
     draft = ReservationDraft(
         customer_name="Tabinda",
+        customer_email="tabinda@example.com",
         customer_phone="+1234567890",
         reservation_date="2026-11-10",
         reservation_time="19:30",

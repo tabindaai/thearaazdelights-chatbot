@@ -49,9 +49,10 @@ class ReservationDraft(BaseModel):
         return bool(self.reservation_date and self.reservation_time and self.guest_count)
 
     def has_required_booking_fields(self) -> bool:
-        """Determines if mandatory booking fields (name, date, time, guests) are present. Phone is optional."""
+        """Determines if mandatory booking fields (name, email, date, time, guests) are present. Phone is optional."""
         return bool(
             self.customer_name
+            and self.customer_email
             and self.reservation_date
             and self.reservation_time
             and self.guest_count
@@ -66,6 +67,8 @@ class ReservationDraft(BaseModel):
         missing = []
         if not self.customer_name:
             missing.append("your name")
+        if not self.customer_email:
+            missing.append("your email address")
         if not self.reservation_date:
             missing.append("the reservation date")
         if not self.reservation_time:
@@ -106,6 +109,9 @@ class SessionMemory:
         self.last_availability_result: Optional[Dict[str, Any]] = None
         self.last_checked_params: Optional[Dict[str, Any]] = None
         self.last_confirmed_reservation_id: Optional[str] = None
+        self.google_calendar_authorized: bool = False
+        self.authorized_google_email: Optional[str] = None
+        self.last_confirmed_calendar_event_id: Optional[str] = None
         self.created_at: datetime = datetime.now(timezone.utc)
         self.updated_at: datetime = datetime.now(timezone.utc)
 
@@ -139,6 +145,9 @@ class SessionMemory:
         self.last_availability_result = None
         self.last_checked_params = None
         self.last_confirmed_reservation_id = None
+        self.google_calendar_authorized = False
+        self.authorized_google_email = None
+        self.last_confirmed_calendar_event_id = None
         self.updated_at = datetime.now(timezone.utc)
 
 

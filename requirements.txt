@@ -24,3 +24,8 @@ mcp==1.30.0
 # PostgreSQL Database
 SQLAlchemy>=2.0
 psycopg[binary]>=3.0
+
+# Google Calendar & OAuth 2.0 Integration
+google-api-python-client>=2.100.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.0

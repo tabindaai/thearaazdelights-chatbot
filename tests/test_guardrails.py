@@ -77,14 +77,35 @@ def test_guest_count_boundaries():
     assert valid_ok is True
 
 
+def test_email_validation():
+    """Verify email address format validation."""
+    valid, _ = Guardrails.validate_email("test@example.com")
+    assert valid is True
+
+    valid_sub, _ = Guardrails.validate_email("user.name+tag@sub.domain.co.uk")
+    assert valid_sub is True
+
+    invalid_empty, msg = Guardrails.validate_email("")
+    assert invalid_empty is False
+    assert "provide your email" in msg
+
+    invalid_no_at, msg = Guardrails.validate_email("plainaddress")
+    assert invalid_no_at is False
+
+    invalid_no_domain, msg = Guardrails.validate_email("user@")
+    assert invalid_no_domain is False
+
+
 def test_booking_gate_prevents_unconfirmed_reservation():
     """CRITICAL SAFETY TEST: Verify booking cannot occur without explicit customer confirmation."""
     draft = ReservationDraft(
         customer_name="Tabinda",
+        customer_email="tabinda@example.com",
         customer_phone="+1234567890",
         reservation_date="2026-11-10",
         reservation_time="19:30",
         guest_count=4,
+        hold_token="HOLD-12345",
         confirmed_by_customer=False,  # NOT confirmed!
     )
     can_book, reason = Guardrails.can_execute_booking(draft, ConversationState.SLOT_AVAILABLE)
@@ -96,10 +117,12 @@ def test_booking_gate_permits_confirmed_reservation():
     """Verify booking is authorized once customer explicitly confirms and details are complete."""
     draft = ReservationDraft(
         customer_name="Tabinda",
+        customer_email="tabinda@example.com",
         customer_phone="+1234567890",
         reservation_date="2026-11-10",
         reservation_time="19:30",
         guest_count=4,
+        hold_token="HOLD-12345",
         confirmed_by_customer=True,  # Confirmed!
     )
     can_book, _ = Guardrails.can_execute_booking(draft, ConversationState.AWAITING_CUSTOMER_CONFIRMATION)
