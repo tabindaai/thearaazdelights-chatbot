@@ -92,6 +92,16 @@ class RestaurantChatbotAgent:
             message = sanitized_text.lower().strip()
             normalized = message.rstrip("!.,? ")
 
+            # Farewell / closing messages after confirmation → warm goodbye (deterministic, no LLM)
+            if Guardrails.is_closing_message(sanitized_text):
+                guest_name = session.draft.customer_name or "there"
+                farewell_reply = (
+                    f"Thank you, {guest_name}! We look forward to welcoming you at The Araaz Delights. "
+                    "Have a wonderful day! 😊"
+                )
+                session.add_user_message(sanitized_text)
+                session.add_model_message(farewell_reply)
+                return farewell_reply, session.state.value, session.last_confirmed_reservation_id
 
             # Show existing booking details only for explicit status requests
             status_phrases = [
@@ -194,6 +204,23 @@ class RestaurantChatbotAgent:
                 return error_reply, session.state.value, None
 
         
+        # 2.5. Deterministic past-date rejection BEFORE hitting Gemini
+        past_date_match = re.search(
+            r"\b(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b",
+            sanitized_text,
+        )
+        if past_date_match:
+            candidate_date_str = past_date_match.group(1)
+            date_valid, date_err = Guardrails.validate_reservation_date(candidate_date_str)
+            if not date_valid and "past" in date_err.lower():
+                past_date_reply = (
+                    f"That date ({candidate_date_str}) is in the past. "
+                    "Could you please provide today's date or a future date for your reservation?"
+                )
+                session.add_user_message(sanitized_text)
+                session.add_model_message(past_date_reply)
+                return past_date_reply, session.state.value, session.last_confirmed_reservation_id
+
         # 3. Topic relevance guardrail: Enforce reservation-only scope across all stages
         if Guardrails.is_off_topic(sanitized_text, session):
             logger.info(f"Off-topic message detected for session '{session_id}': '{sanitized_text[:50]}'")
@@ -203,17 +230,45 @@ class RestaurantChatbotAgent:
                 session.last_confirmed_reservation_id
             )
 
-        # 4. Context-aware extraction of details directly from customer input
         clean = sanitized_text.strip()
 
+        # Find the last message sent by the assistant to provide context
+        last_bot_msg = ""
+        for m in reversed(session.history):
+            if m.get("role") == "model" and m.get("parts"):
+                last_bot_msg = m["parts"][0].get("text", "").lower()
+                break
+
+        # 3.1 Check for incomplete email address submission (e.g. "zara987 is my email adress" or "zara987")
+        incomplete_email = Guardrails.detect_incomplete_email(clean, last_bot_msg)
+        if incomplete_email:
+            guest_name_part = f", {session.draft.customer_name}" if session.draft.customer_name else ""
+            incomplete_reply = (
+                f"Thank you{guest_name_part}! It looks like that email address is incomplete (`{incomplete_email}`). "
+                f"Could you please provide your full email address (including the '@' and domain, such as `{incomplete_email}@gmail.com`) "
+                "so we can send your confirmation and reminder?"
+            )
+            session.add_user_message(sanitized_text)
+            session.add_model_message(incomplete_reply)
+            return incomplete_reply, session.state.value, session.last_confirmed_reservation_id
+
+        # 4. Context-aware extraction of details directly from customer input
         # 4.1 Auto-extract email address if present in message
         email_match = re.search(r"\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b", clean)
-        if email_match and not session.draft.customer_email:
-            extracted_email = email_match.group(1).lower()
-            logger.info(f"Auto-extracted customer email '{extracted_email}' for session '{session_id}'")
-            session.draft.customer_email = extracted_email
-            if session.draft.has_required_booking_fields() and session.draft.hold_token:
-                session.set_state(ConversationState.AWAITING_CUSTOMER_CONFIRMATION)
+        if email_match:
+            raw_cand = email_match.group(1).lower()
+            extracted_email = Guardrails.normalize_email(raw_cand)
+            if not session.draft.customer_email:
+                logger.info(f"Auto-extracted customer email '{extracted_email}' (normalized from '{raw_cand}') for session '{session_id}'")
+                session.draft.customer_email = extracted_email
+                if session.draft.has_required_booking_fields() and session.draft.hold_token:
+                    session.set_state(ConversationState.AWAITING_CUSTOMER_CONFIRMATION)
+            if not session.customer_profile or (session.customer_profile.get("email", "").lower() != extracted_email):
+                try:
+                    tools_instance = AgentTools(session)
+                    tools_instance.get_customer_profile(email=extracted_email)
+                except Exception as crm_err:
+                    logger.warning(f"Could not auto-fetch CRM profile for email {extracted_email}: {crm_err}")
 
         # 4.2 Auto-extract customer name
         if not session.draft.customer_name:
@@ -289,6 +344,7 @@ class RestaurantChatbotAgent:
             special_requests: str = "",
             confirmed_by_customer: bool = False,
             seating_preference: str = "",
+            dietary_preferences: str = "",
         ) -> Dict[str, Any]:
             """Record customer details, seating preferences, or explicit confirmation extracted from conversation."""
             return tools_instance.update_reservation_details(
@@ -301,6 +357,7 @@ class RestaurantChatbotAgent:
                 special_requests=special_requests or None,
                 confirmed_by_customer=confirmed_by_customer if confirmed_by_customer else None,
                 seating_preference=seating_preference or None,
+                dietary_preferences=dietary_preferences or None,
             )
 
         def check_table_availability(
@@ -370,6 +427,22 @@ class RestaurantChatbotAgent:
             """Save the current confirmed reservation to the customer's authorized Google Calendar with a 3-hour reminder."""
             return tools_instance.save_to_google_calendar()
 
+        def get_customer_profile(email: str = "", phone: str = "") -> Dict[str, Any]:
+            """Lookup customer loyalty profile, VIP tier, visit history, and preferences by email or phone."""
+            return tools_instance.get_customer_profile(email=email or None, phone=phone or None)
+
+        def update_customer_preferences(
+            dietary_preferences: str = "",
+            seating_preference: str = "",
+            notes: str = "",
+        ) -> Dict[str, Any]:
+            """Update customer's dietary restrictions, seating preferences, or notes in the CRM system."""
+            return tools_instance.update_customer_preferences(
+                dietary_preferences=dietary_preferences or None,
+                seating_preference=seating_preference or None,
+                notes=notes or None,
+            )
+
         # 5. Build Dynamic System Prompt with current runtime state
         system_instruction = build_system_prompt(session)
 
@@ -384,6 +457,8 @@ class RestaurantChatbotAgent:
                 cancel_existing_reservation,
                 update_confirmed_reservation,
                 save_to_google_calendar,
+                get_customer_profile,
+                update_customer_preferences,
             ]
 
             # Build message history for Gemini SDK
@@ -448,6 +523,24 @@ class RestaurantChatbotAgent:
                 raise last_exc or RuntimeError("All Gemini model candidates failed to respond.")
 
             raw_reply = response.text or "I have processed your request. How else may I assist you?"
+
+            # Ensure returning guest recognition greeting is present if returning customer was recognized
+            if session.is_returning_customer and not session.returning_guest_greeted and session.customer_profile:
+                past_visits = session.customer_profile.get("total_visits", 1)
+                upcoming_visit = past_visits + 1
+                suffix = "th" if 11 <= (upcoming_visit % 100) <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(upcoming_visit % 10, "th")
+                visit_str = f"{upcoming_visit}{suffix}"
+                guest_name = session.draft.customer_name or session.customer_profile.get("name") or "valued guest"
+
+                has_welcome = "welcome back" in raw_reply.lower()
+                has_visit = f"{visit_str} visit" in raw_reply.lower() or f"{upcoming_visit}" in raw_reply.lower()
+
+                if not (has_welcome and has_visit):
+                    welcome_prefix = f"Welcome back, {guest_name}! Wonderful to have you back at The Araaz Delights for your {visit_str} visit.\n\n"
+                    if has_welcome:
+                        raw_reply = re.sub(r"(?i)welcome back[^.!?\n]*[.!?]?\s*", "", raw_reply)
+                    raw_reply = welcome_prefix + raw_reply.strip()
+                session.returning_guest_greeted = True
 
             # 7. Apply Output Guardrails
             sanitized_reply = Guardrails.sanitize_output(raw_reply)

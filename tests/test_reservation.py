@@ -28,9 +28,22 @@ from services.restaurant_api import RestaurantAPIClient
 FUTURE_DATE = (date.today() + timedelta(days=7)).strftime("%Y-%m-%d")
 
 
+_DB_ACCESSIBLE = None
+
 @pytest.fixture(autouse=True)
 def clean_test_db():
     """Ensure clean database state before each test run."""
+    global _DB_ACCESSIBLE
+    if _DB_ACCESSIBLE is False:
+        yield
+        return
+
+    from services.db import is_database_configured
+    if not is_database_configured():
+        _DB_ACCESSIBLE = False
+        yield
+        return
+
     try:
         from services.db import SessionLocal
         from sqlalchemy import text
@@ -38,8 +51,9 @@ def clean_test_db():
         s.execute(text("DELETE FROM reservations WHERE customer_name IN ('Tabinda', 'Fayaz', 'Zainab', 'Sarah', 'Imran', 'Kiran', 'Alice', 'Bob', 'David', 'CapacityBlocker')"))
         s.commit()
         s.close()
+        _DB_ACCESSIBLE = True
     except Exception:
-        pass
+        _DB_ACCESSIBLE = False
     yield
 
 

@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 _SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 _RESTAURANT_ADDRESS = "The Araaz Delights, 123 Fine Dining Avenue"
 _EVENT_TITLE = "Restaurant Reservation - Araaz Delights"
-_REMINDER_MINUTES = 180
+_REMINDER_MINUTES = 3
 _EVENT_DURATION_HOURS = 2
 
 
@@ -233,8 +233,8 @@ class CalendarService:
             if token_data.get("token_expiry"):
                 try:
                     expiry_dt = datetime.fromisoformat(token_data["token_expiry"])
-                    if expiry_dt.tzinfo is None:
-                        expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+                    if expiry_dt.tzinfo is not None:
+                        expiry_dt = expiry_dt.astimezone(tzinfo=timezone.utc).replace(tzinfo=None)
                 except (ValueError, TypeError):
                     expiry_dt = None
 
@@ -249,7 +249,12 @@ class CalendarService:
             )
 
             # Refresh if expired or about to expire.
-            if credentials.expired and credentials.refresh_token:
+            if (
+                expiry_dt is not None
+                and expiry_dt <= datetime.now(timezone.utc)
+                and credentials.refresh_token
+            ):
+
                 try:
                     credentials.refresh(Request())
                     # Persist refreshed tokens (do NOT log token values).
@@ -359,9 +364,16 @@ class CalendarService:
                 "reminders": {
                     "useDefault": False,
                     "overrides": [
-                        {"method": "popup", "minutes": _REMINDER_MINUTES},
+                        {
+                            "method": "popup",
+                            "minutes": _REMINDER_MINUTES,
+                        },
+                        {
+                            "method": "email",
+                            "minutes": _REMINDER_MINUTES,
+                        },
                     ],
-                },
+                }
             }
 
             created_event = service.events().insert(
@@ -454,13 +466,24 @@ class CalendarService:
             existing_event["description"] = description
             existing_event["reminders"] = {
                 "useDefault": False,
-                "overrides": [{"method": "popup", "minutes": _REMINDER_MINUTES}],
+                "overrides": [{"method": "popup", "minutes": _REMINDER_MINUTES},{"method":"email","minutes":_REMINDER_MINUTES}],
             }
 
             updated_event = service.events().update(
                 calendarId="primary", eventId=event_id, body=existing_event
             ).execute()
 
+            # Verify reminders saved by Google Calendar
+            verified_event = service.events().get(
+                calendarId="primary",
+                eventId=event_id,
+            ).execute()
+
+            logger.info(
+                "Verified reminder configuration: %s",
+                verified_event.get("reminders", {})
+            )
+             
             logger.info(
                 "Calendar event updated for session %s, event_id %s", session_id, event_id
             )

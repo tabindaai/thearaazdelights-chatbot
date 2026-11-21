@@ -223,6 +223,11 @@ class MCPClient:
 
     def _start(self):
         """Start the background MCP thread if not already running."""
+        # Fast exit without blocking if neither MCP server port is reachable
+        if not _is_server_reachable(RESTAURANT_MCP_SERVER_URL) and not _is_server_reachable(CALENDAR_MCP_SERVER_URL):
+            self.ready.set()
+            return
+
         with self.lock:
             if self.thread is None or not self.thread.is_alive():
                 self.ready.clear()
@@ -234,7 +239,7 @@ class MCPClient:
                 )
                 self.thread.start()
 
-        if not self.ready.wait(timeout=5):
+        if not self.ready.wait(timeout=2):
             logger.warning("MCP client initialization timed out. Direct database fallback will be used.")
 
         if self.startup_error:
@@ -303,12 +308,27 @@ class MCPClient:
         """
         self._start()
 
+        if self.loop is None or not self.loop.is_running():
+            raise RuntimeError("MCP client background event loop is not running.")
+
+        is_calendar = tool_name in CALENDAR_TOOLS
+        if is_calendar and self.calendar_session is None:
+            return {
+                "success": False,
+                "error": f"Google Calendar MCP server is not available at {CALENDAR_MCP_SERVER_URL}.",
+                "calendar_unavailable": True,
+            }
+        if not is_calendar and self.restaurant_session is None:
+            raise RuntimeError(
+                f"Restaurant MCP session is not available at {RESTAURANT_MCP_SERVER_URL}."
+            )
+
         future = asyncio.run_coroutine_threadsafe(
             self._call_tool_async(tool_name, arguments),
             self.loop,
         )
 
-        return future.result(timeout=60)
+        return future.result(timeout=5)
 
     # -------------------------------------------------------------------------
     # Convenience methods for Google Calendar operations

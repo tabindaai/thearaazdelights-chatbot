@@ -182,6 +182,20 @@ def disconnect_google_calendar():
     st.session_state.google_calendar_email = None
 
 
+def fetch_session_details() -> dict:
+    """Fetch active session state and customer CRM profile from FastAPI backend."""
+    try:
+        res = requests.get(
+            f"{FASTAPI_URL}/session/{st.session_state.session_id}",
+            timeout=2.0
+        )
+        if res.status_code == 200:
+            return res.json()
+    except Exception:
+        pass
+    return {}
+
+
 # Process OAuth callback redirect parameters
 _query_params = st.query_params
 
@@ -236,6 +250,28 @@ with st.sidebar:
 
     if st.session_state.reservation_id:
         st.success(f"🎉 **Booked ID:** `{st.session_state.reservation_id}`")
+
+    # CRM Guest Loyalty Profile
+    session_data = fetch_session_details()
+    crm_profile = session_data.get("customer_profile")
+    if crm_profile:
+        st.divider()
+        tier = crm_profile.get("vip_tier", "Standard")
+        tier_badges = {
+            "VIP Platinum": "💎 VIP Platinum",
+            "Gold": "🥇 Gold Tier",
+            "Silver": "🥈 Silver Tier",
+            "Standard": "🥉 Standard Member",
+        }
+        badge = tier_badges.get(tier, f"⭐ {tier}")
+        st.markdown("### 👑 Guest Loyalty Profile")
+        st.markdown(f"**Status:** `{badge}`")
+        st.markdown(f"**Guest:** `{crm_profile.get('name')}`")
+        st.markdown(f"**Total Visits:** `{crm_profile.get('total_visits', 1)}`")
+        if crm_profile.get("dietary_preferences"):
+            st.caption(f"🥗 **Dietary:** {crm_profile.get('dietary_preferences')}")
+        if crm_profile.get("seating_preference"):
+            st.caption(f"🪑 **Seating:** {crm_profile.get('seating_preference')}")
 
     st.divider()
 

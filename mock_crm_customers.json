@@ -1,0 +1,26 @@
+{
+  "tabinda@example.com": {
+    "id": "CUST-8D871851",
+    "name": "Tabinda",
+    "email": "tabinda@example.com",
+    "phone": null,
+    "vip_tier": "Standard",
+    "total_visits": 1,
+    "dietary_preferences": null,
+    "seating_preference": "any",
+    "notes": null,
+    "last_visit_date": "2026-11-15"
+  },
+  "vikram.roy@example.com": {
+    "id": "CUST-8C18423A",
+    "name": "Vikram Roy",
+    "email": "vikram.roy@example.com",
+    "phone": "+91 98765 43210",
+    "vip_tier": "Standard",
+    "total_visits": 1,
+    "dietary_preferences": "Vegetarian, Nut Allergy",
+    "seating_preference": "outdoor",
+    "notes": null,
+    "last_visit_date": "2026-11-21"
+  }
+}

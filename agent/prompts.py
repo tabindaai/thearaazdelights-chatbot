@@ -239,6 +239,10 @@ Your responsibility is STRICTLY LIMITED to helping guests with restaurant table 
    - Ask for missing details naturally and politely; never ask for information already provided.
    - Recognize email addresses provided in natural conversation (e.g. "my email is john@example.com", "arun@gmail.com").
    - Validate that the email has an '@' symbol and a valid domain format.
+   - STRICT PROHIBITION AGAINST AUTOCOMPLETING OR FABRICATING EMAIL DOMAINS:
+     * If the customer provides an incomplete email address (e.g. only a username like 'zara987', or 'zara987 is my email adress', or an address without an '@' and domain), NEVER invent, assume, or append '@example.com', '@gmail.com', or any other domain suffix!
+     * NEVER call `update_reservation_details(email=...)` with an invented, autocompleted, or hallucinated email.
+     * Politely ask the customer for their full, complete email address including the domain (e.g. "Could you please provide your full email address including the domain, such as zara987@gmail.com?").
    - If the customer corrects their email, update it smoothly using `update_reservation_details(email=...)`.
    - Never demand a phone number. Email is the standard contact requirement for The Araaz Delights.
 
@@ -250,6 +254,17 @@ Your responsibility is STRICTLY LIMITED to helping guests with restaurant table 
    - If Google Calendar is not connected, the confirmation message will automatically provide a direct link to connect and sync their Google Calendar.
    - Remind customers that actual notification delivery depends on their personal Google Calendar and device notification settings.
    - Never fabricate calendar event IDs or pretend an event is saved when it has not been.
+
+15. CRM & VIP GUEST RECOGNITION:
+
+   - The Araaz Delights features an integrated CRM (Customer Relationship Management) system.
+   - When a guest is recognized as a returning customer (marked as 'RETURNING GUEST' in RUNTIME CONTEXT):
+     * You MUST warmly greet them by name with "Welcome back, [Name]!", explicitly acknowledging that this is their 2nd (or 3rd, 4th, etc.) visit to The Araaz Delights!
+     * Example: "Welcome back, Zara! It's wonderful to see you again at The Araaz Delights for your 2nd visit."
+     * Acknowledge their loyalty tier (Standard, Silver, Gold, VIP Platinum).
+     * Seamlessly remember their known dietary restrictions/allergies and seating preferences without forcing them to re-enter details they already provided in past visits.
+     * If the customer mentions new dietary restrictions, allergies, seating preferences, or notes, call `update_customer_preferences` or record them with `update_reservation_details`.
+     * VIP Platinum (10+ visits) and Gold (6-9 visits) guests receive top-priority, ultra-gracious hospitality.
 """
 
 
@@ -286,6 +301,12 @@ def build_system_prompt(session: SessionMemory) -> str:
 
     if draft.special_requests:
         known_details.append(f"- Special Requests: {draft.special_requests}")
+
+    if draft.seating_preference:
+        known_details.append(f"- Seating Preference: {draft.seating_preference}")
+
+    if draft.dietary_preferences:
+        known_details.append(f"- Dietary Restrictions / Preferences: {draft.dietary_preferences}")
 
     known_details_section = (
         "\n".join(known_details)
@@ -324,6 +345,40 @@ def build_system_prompt(session: SessionMemory) -> str:
     if session.google_calendar_authorized and session.authorized_google_email:
         cal_auth = f"Connected ({session.authorized_google_email})"
 
+    # Customer CRM profile section
+    crm_section = []
+    if session.customer_profile:
+        prof = session.customer_profile
+        past_visits = prof.get("total_visits", 1)
+        upcoming_visit = past_visits + 1
+        suffix = "th" if 11 <= (upcoming_visit % 100) <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(upcoming_visit % 10, "th")
+        visit_str = f"{upcoming_visit}{suffix}"
+
+        crm_section.append(
+            f"* Guest Identity: RETURNING GUEST (Loyalty Tier: {prof.get('vip_tier', 'Standard')} | "
+            f"Total Visits: {past_visits} | This reservation is their {visit_str} visit to The Araaz Delights!)"
+        )
+        if prof.get("name"):
+            crm_section.append(f"* CRM Profile Name: {prof.get('name')}")
+        if prof.get("dietary_preferences"):
+            crm_section.append(f"* Known Dietary Restrictions: {prof.get('dietary_preferences')}")
+        if prof.get("seating_preference"):
+            crm_section.append(f"* Known Preferred Seating: {prof.get('seating_preference')}")
+        if prof.get("notes"):
+            crm_section.append(f"* Guest CRM Notes: {prof.get('notes')}")
+        if prof.get("last_visit_date"):
+            crm_section.append(f"* Last Visit Date: {prof.get('last_visit_date')}")
+
+        crm_section.append(
+            f"* MANDATORY GREETING INSTRUCTION: You MUST greet them as a returning guest! "
+            f"Say: 'Welcome back, {prof.get('name', 'valued guest')}! Wonderful to see you again at The Araaz Delights for your {visit_str} visit.' "
+            f"Acknowledge their {prof.get('vip_tier', 'Standard')} loyalty tier."
+        )
+    else:
+        crm_section.append("* Guest Identity: New Guest / Identity Not Yet Looked Up")
+
+    crm_info_str = "\n".join(crm_section)
+
     context_prompt = f"""
 {BASE_SYSTEM_INSTRUCTION}
 
@@ -332,6 +387,7 @@ def build_system_prompt(session: SessionMemory) -> str:
 * Current Conversation State: {session.state.value}
 * Table Availability Status: {avail_status}
 * Google Calendar Status: {cal_auth}
+{crm_info_str}
 
 --- KNOWN RESERVATION DETAILS ALREADY PROVIDED (DO NOT RE-ASK FOR THESE) ---
 {known_details_section}

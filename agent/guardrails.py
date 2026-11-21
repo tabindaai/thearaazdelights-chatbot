@@ -137,13 +137,15 @@ class Guardrails:
 
         # Closing markers
         closing_markers = [
-            r"\b(bye|goodbye|good bye|farewell|see you|see you later|take care)\b",
-            r"\b(have a (nice|good|great|wonderful) day)\b",
+            r"\b(bye+|goodbye|good bye|bye bye|farewell|see you|see you later|see ya|take care)\b",
+            r"\b(have a (nice|good|great|wonderful) (day|evening|night|time))\b",
+            r"\b(good\s*night)\b",
             r"\b(that's all|thats all|that is all|nothing else|nothing more|i'm done|i am done|all done|i'm finished|i am finished)\b",
             r"\b(no thanks|no thank you|no thankyou)\b",
+            r"\b(you too)\b",
         ]
 
-        if any(re.search(marker, message) for marker in closing_markers):
+        if any(re.search(marker, message) for marker in closing_markers) or message in {"ok", "okay", "sure", "thanks", "thank you", "thank u", "thankyou", "thx", "ty", "you too", "take care"}:
             # Ensure it is not asking a new reservation request
             booking_keywords = r"\b(book|reserve|table|reservation|modify|cancel)\b"
             if not re.search(booking_keywords, message):
@@ -151,12 +153,22 @@ class Guardrails:
 
         # Standalone gratitude or polite acknowledgement without booking intent
         gratitude_phrases = [
-            "thank you", "thanks", "thank u", "thanks a lot",
+            "thank you", "thanks", "thank u", "thankyou", "thank you!",
+            "thanks!", "thanku", "thx", "ty",
+            "thanks a lot", "thanks a bunch",
             "thank you so much", "thanks so much", "thank you very much",
             "okay thanks", "ok thanks", "ok thank you", "okay thank you",
-            "sure thanks", "alright thanks", "alrighty thanks"
+            "sure thanks", "alright thanks", "alrighty thanks",
+            "thanks bye", "thank you bye", "thanks goodbye",
+            "okay bye", "ok bye", "sure bye",
+            "alright bye", "okay goodbye", "ok goodbye",
         ]
         if message in gratitude_phrases:
+            return True
+
+        # Fuzzy gratitude pattern for variants like "thankyou so much", "thanks a ton", etc.
+        gratitude_pattern = r"^(thank\s*you|thanks|thankyou|thanku|thx|ty)(\s+(so\s+much|very\s+much|a\s+lot|a\s+bunch|a\s+ton))?[!.]*$"
+        if re.match(gratitude_pattern, message):
             return True
 
         return False
@@ -401,6 +413,39 @@ class Guardrails:
         return True, "Valid phone"
 
     @staticmethod
+    def normalize_email(email_str: Optional[str]) -> Optional[str]:
+        """
+        Normalizes email address by trimming, lowercasing, and fixing common domain typos
+        (e.g., 'gamil.com' -> 'gmail.com', 'yaho.com' -> 'yahoo.com').
+        """
+        if not email_str:
+            return None
+        clean = email_str.strip().lower()
+        if "@" not in clean:
+            return clean
+
+        user_part, domain_part = clean.rsplit("@", 1)
+        domain_fixes = {
+            "gamil.com": "gmail.com",
+            "gmial.com": "gmail.com",
+            "gmaill.com": "gmail.com",
+            "gmal.com": "gmail.com",
+            "gmai.com": "gmail.com",
+            "yaho.com": "yahoo.com",
+            "yahooo.com": "yahoo.com",
+            "yaho.co.in": "yahoo.co.in",
+            "hotmial.com": "hotmail.com",
+            "hotmaill.com": "hotmail.com",
+            "outlok.com": "outlook.com",
+            "outloo.com": "outlook.com",
+            "iclud.com": "icloud.com",
+        }
+        if domain_part in domain_fixes:
+            domain_part = domain_fixes[domain_part]
+
+        return f"{user_part}@{domain_part}"
+
+    @staticmethod
     def validate_email(email_str: Optional[str]) -> Tuple[bool, str]:
         """Validates customer email address format. Email is required for reservation and Google Calendar reminder."""
         if not email_str or not email_str.strip():
@@ -415,6 +460,63 @@ class Guardrails:
             )
 
         return True, "Valid email"
+
+    @staticmethod
+    def detect_incomplete_email(text: str, last_bot_message: str = "") -> Optional[str]:
+        """
+        Detects if the user is attempting to provide an email address,
+        but it is incomplete (e.g., missing '@' or missing domain suffix).
+        Returns the partial/incomplete candidate string if found, else None.
+        """
+        if not text:
+            return None
+        clean = text.strip()
+        # If the message already contains a full valid email, it's valid, not incomplete.
+        if re.search(r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b", clean):
+            return None
+
+        # Pattern 1: "[token] is my email [address]" or "[token] is email"
+        m1 = re.search(
+            r"(\S+)\s+is\s+(?:my\s+)?(?:email|e-mail|mail)(?:\s+address|\s+adress)?",
+            clean,
+            re.IGNORECASE,
+        )
+        if m1:
+            cand = m1.group(1).strip(".,!?:;\"'()")
+            if cand.lower() not in ("what", "here", "this", "that", "it", "where"):
+                return cand
+
+        # Pattern 2: "my email [address] is [token]" or "email: [token]" or "email is [token]" or "email [token]"
+        m2 = re.search(
+            r"(?:my\s+)?(?:email|e-mail|mail)(?:\s+address|\s+adress)?\s*(?:is|:|=|\s)\s*(\S+)",
+            clean,
+            re.IGNORECASE,
+        )
+        if m2:
+            cand = m2.group(1).strip(".,!?:;\"'()")
+            if cand.lower() not in ("what", "not", "none", "no", "why"):
+                return cand
+
+        # Pattern 3: User typed something with '@' but missing domain or invalid, e.g. "zara@" or "zara@gmail"
+        m3 = re.search(r"(\S*@\S*)", clean)
+        if m3:
+            cand = m3.group(1).strip(".,!?:;\"'()")
+            if not re.match(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$", cand):
+                return cand
+
+        # Pattern 4: If bot asked for email in the last turn, and user replies with a single token (username)
+        if last_bot_message and "email" in last_bot_message.lower():
+            words = clean.split()
+            if len(words) == 1:
+                cand = words[0].strip(".,!?:;\"'()")
+                disqualified = {
+                    "hi", "hello", "hey", "hii", "no", "yes", "cancel", "stop",
+                    "bye", "none", "skip", "ok", "okay", "sure", "indoor", "outdoor"
+                }
+                if cand.lower() not in disqualified and len(cand) >= 2 and not cand.isdigit():
+                    return cand
+
+        return None
 
     # ------------------------------------------------------------------------
     # 3. CONFIRMATION DETECTION & TOOL EXECUTION GATE

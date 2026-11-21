@@ -140,3 +140,30 @@ def test_output_sanitization():
     clean_trace = Guardrails.sanitize_output(raw_trace)
     assert "Traceback" not in clean_trace
     assert "An internal error occurred" in clean_trace
+
+
+def test_detect_incomplete_email():
+    """Verify that incomplete or domain-less emails are flagged without autocompleting."""
+    # Pattern 1: "[token] is my email adress"
+    assert Guardrails.detect_incomplete_email("zara987 is my email adress") == "zara987"
+    assert Guardrails.detect_incomplete_email("zara987 is my email") == "zara987"
+    assert Guardrails.detect_incomplete_email("john.doe is my email address") == "john.doe"
+
+    # Pattern 2: "my email is [token]"
+    assert Guardrails.detect_incomplete_email("my email is zara987") == "zara987"
+    assert Guardrails.detect_incomplete_email("email: zara987") == "zara987"
+
+    # Pattern 3: '@' present but invalid or missing domain
+    assert Guardrails.detect_incomplete_email("zara987@") == "zara987@"
+    assert Guardrails.detect_incomplete_email("zara987@gmail") == "zara987@gmail"
+
+    # Pattern 4: Response to bot asking for email
+    assert Guardrails.detect_incomplete_email("zara987", last_bot_message="please share your email address") == "zara987"
+
+    # Full valid emails must NOT be flagged as incomplete
+    assert Guardrails.detect_incomplete_email("zara987@gmail.com") is None
+    assert Guardrails.detect_incomplete_email("my email is zara987@gmail.com") is None
+
+    # Normal messages without email intent must NOT be flagged
+    assert Guardrails.detect_incomplete_email("table for 4 tomorrow at 7pm") is None
+    assert Guardrails.detect_incomplete_email("hello, how are you?") is None

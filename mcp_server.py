@@ -181,6 +181,62 @@ def update_reservation(
     }
 
 
+# ============================================================================
+# CRM (CUSTOMER RELATIONSHIP MANAGEMENT) TOOLS
+# ============================================================================
+
+@mcp.tool()
+def get_customer_profile(
+    email: str = "",
+    phone: str = "",
+    customer_id: str = "",
+) -> dict:
+    """
+    Look up a customer's CRM profile by email, phone, or customer ID.
+    Returns customer VIP tier, visit count, dietary preferences/allergies, and notes.
+    """
+    profile = restaurant_api.get_customer_profile(
+        email=email or None,
+        phone=phone or None,
+        customer_id=customer_id or None,
+    )
+    if profile:
+        return {
+            "found": True,
+            "profile": profile,
+            "message": f"Customer profile found for {profile.get('name')}.",
+        }
+    return {
+        "found": False,
+        "message": "No existing customer profile found. This is a first-time guest.",
+    }
+
+
+@mcp.tool()
+def update_customer_preferences(
+    email: str = "",
+    customer_id: str = "",
+    dietary_preferences: str = "",
+    seating_preference: str = "",
+    notes: str = "",
+    phone: str = "",
+) -> dict:
+    """
+    Update customer preferences (allergies, dietary restrictions, seating, or VIP notes).
+    """
+    target = customer_id or email
+    if not target:
+        return {"success": False, "error": "Either customer_id or email is required."}
+
+    return restaurant_api.update_customer_preferences(
+        email_or_id=target,
+        dietary_preferences=dietary_preferences or None,
+        seating_preference=seating_preference or None,
+        notes=notes or None,
+        phone=phone or None,
+    )
+
+
 if __name__ == "__main__":
     mcp.run(
         transport="streamable-http"

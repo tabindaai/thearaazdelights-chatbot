@@ -58,9 +58,14 @@ engine: Optional[Engine] = None
 SessionLocal: Optional[sessionmaker] = None
 
 if DATABASE_URL:
+    connect_args = {}
+    if "postgresql" in str(DATABASE_URL):
+        connect_args["connect_timeout"] = 2
+
     engine = create_engine(
         DATABASE_URL,
         pool_pre_ping=True,
+        connect_args=connect_args,
     )
 
     SessionLocal = sessionmaker(
@@ -79,8 +84,17 @@ else:
 
 
 def is_database_configured() -> bool:
-    """Return whether PostgreSQL is configured."""
-    return engine is not None and SessionLocal is not None
+    """Return whether PostgreSQL is configured and actively reachable."""
+    if engine is None or SessionLocal is None:
+        return False
+    host = os.getenv("DB_HOST", "127.0.0.1")
+    port = int(os.getenv("DB_PORT", "5432"))
+    try:
+        import socket
+        with socket.create_connection((host, port), timeout=0.2):
+            return True
+    except (OSError, ConnectionRefusedError, TimeoutError):
+        return False
 
 
 def get_db() -> Generator[Session, None, None]:

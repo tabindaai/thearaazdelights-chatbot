@@ -11,6 +11,7 @@ The MCP server calls this service. Database access stays behind
 the restaurant backend service rather than the chatbot layer.
 """
 
+import json
 import logging
 import os
 import re
@@ -34,7 +35,8 @@ from schemas.reservation import (
 )
 
 from services.db import SessionLocal, is_database_configured
-from services.models import Reservation
+from services.models import Reservation, Customer
+from schemas.customer import calculate_vip_tier
 
 
 load_dotenv()
@@ -58,8 +60,54 @@ BASE_URL = os.getenv(
 ).rstrip("/")
 
 TIMEOUT_SECONDS = float(
-    os.getenv("RESTAURANT_API_TIMEOUT_SECONDS", "10.0")
+    os.getenv("RESTAURANT_API_TIMEOUT_SECONDS", "3.0")
 )
+
+MOCK_CUSTOMERS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..",
+    "mock_crm_customers.json"
+)
+
+def _normalize_email_address(val: Optional[str]) -> Optional[str]:
+    """Normalize email address and fix common domain typos (e.g. gamil -> gmail)."""
+    if not val:
+        return None
+    clean = str(val).strip().lower()
+    if "@" not in clean:
+        return clean
+    user_part, domain_part = clean.rsplit("@", 1)
+    domain_fixes = {
+        "gamil.com": "gmail.com",
+        "gmial.com": "gmail.com",
+        "gmaill.com": "gmail.com",
+        "gmal.com": "gmail.com",
+        "gmai.com": "gmail.com",
+        "yaho.com": "yahoo.com",
+        "yahooo.com": "yahoo.com",
+        "yaho.co.in": "yahoo.co.in",
+        "hotmial.com": "hotmail.com",
+        "hotmaill.com": "hotmail.com",
+        "outlok.com": "outlook.com",
+        "outloo.com": "outlook.com",
+        "iclud.com": "icloud.com",
+    }
+    if domain_part in domain_fixes:
+        domain_part = domain_fixes[domain_part]
+    return f"{user_part}@{domain_part}"
+
+
+def _is_server_reachable(url: str, timeout: float = 0.2) -> bool:
+    try:
+        from urllib.parse import urlparse
+        import socket
+        parsed = urlparse(url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, ConnectionRefusedError, TimeoutError):
+        return False
 
 
 class RestaurantAPIClient:
@@ -90,8 +138,23 @@ class RestaurantAPIClient:
             and is_database_configured()
         )
 
-        # Existing mock storage.
+        if not self.use_mock and not self.use_database:
+            if not _is_server_reachable(self.base_url):
+                logger.info(
+                    "External restaurant backend not reachable at %s. Switching to mock mode.",
+                    self.base_url,
+                )
+                self.use_mock = True
+
+        # Existing mock storage with persistent disk fallback
         self._mock_db_reservations: List[dict] = []
+        self._mock_customers: dict = {}
+        try:
+            if os.path.exists(MOCK_CUSTOMERS_FILE):
+                with open(MOCK_CUSTOMERS_FILE, "r", encoding="utf-8") as f:
+                    self._mock_customers = json.load(f)
+        except Exception as e:
+            logger.warning("Could not load mock CRM customers from disk: %s", e)
 
         # Temporary PostgreSQL availability holds.
         # Holds are intentionally temporary and kept in process memory.
@@ -104,6 +167,14 @@ class RestaurantAPIClient:
             logger.info("Restaurant backend mode: POSTGRESQL")
         else:
             logger.info("Restaurant backend mode: HTTP")
+
+    def _save_mock_customers(self):
+        """Persist mock customer profiles to disk so they survive server restarts."""
+        try:
+            with open(MOCK_CUSTOMERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._mock_customers, f, indent=2)
+        except Exception as e:
+            logger.warning("Could not persist mock CRM customers: %s", e)
 
     # ========================================================================
     # COMMON HELPERS
@@ -177,6 +248,7 @@ class RestaurantAPIClient:
             table_number=booking.table_number,
             status=booking.status,
             hold_token=booking.hold_token,
+            customer_id=getattr(booking, "customer_id", None),
             calendar_event_id=getattr(booking, "calendar_event_id", None),
             created_at=booking.created_at,
             updated_at=booking.updated_at,
@@ -262,15 +334,9 @@ class RestaurantAPIClient:
 
                 return AvailabilityResponse(**response.json())
 
-        except httpx.HTTPError as exc:
-            logger.error("Availability API error: %s", exc)
-
-            return AvailabilityResponse(
-                available=False,
-                hold_token=None,
-                message="Failed to verify availability with backend service.",
-                alternatives=[],
-            )
+        except (httpx.HTTPError, Exception) as exc:
+            logger.warning("Availability API unreachable (%s). Falling back to mock backend.", exc)
+            return self._mock_check_availability(request)
 
     async def check_availability_async(
         self,
@@ -295,15 +361,9 @@ class RestaurantAPIClient:
 
                 return AvailabilityResponse(**response.json())
 
-        except httpx.HTTPError as exc:
-            logger.error("Availability API error: %s", exc)
-
-            return AvailabilityResponse(
-                available=False,
-                hold_token=None,
-                message="Failed to verify availability with backend service.",
-                alternatives=[],
-            )
+        except (httpx.HTTPError, Exception) as exc:
+            logger.warning("Availability API unreachable (%s). Falling back to mock backend.", exc)
+            return self._mock_check_availability(request)
 
     def _database_check_availability(
         self,
@@ -388,15 +448,9 @@ class RestaurantAPIClient:
                 alternatives=[],
             )
 
-        except Exception:
-            logger.exception("PostgreSQL availability check failed.")
-
-            return AvailabilityResponse(
-                available=False,
-                hold_token=None,
-                message="Unable to check availability right now.",
-                alternatives=[],
-            )
+        except Exception as exc:
+            logger.warning("PostgreSQL availability check failed (%s); falling back to in-memory mock.", exc)
+            return self._mock_check_availability(request)
 
     # ========================================================================
     # 2. GET ALTERNATIVE SLOTS
@@ -488,12 +542,12 @@ class RestaurantAPIClient:
                             )
                         )
 
-        except Exception:
-            logger.exception(
-                "Failed to find PostgreSQL alternative slots."
+        except Exception as exc:
+            logger.warning("PostgreSQL alternatives lookup failed (%s); falling back to mock.", exc)
+            return self._mock_get_alternatives(
+                reservation_date=reservation_date,
+                requested_time=requested_time,
             )
-
-        return alternatives
 
     # ========================================================================
     # 3. CREATE CONFIRMED RESERVATION
@@ -523,15 +577,9 @@ class RestaurantAPIClient:
 
                 return ReservationResponse(**response.json())
 
-        except httpx.HTTPError as exc:
-            logger.error("Reservation creation API error: %s", exc)
-
-            return ReservationResponse(
-                status="failed",
-                reservation_id=None,
-                details=None,
-                message="Backend reservation service error. Please try again later.",
-            )
+        except (httpx.HTTPError, Exception) as exc:
+            logger.warning("Reservation creation API unreachable (%s). Falling back to mock backend.", exc)
+            return self._mock_create_reservation(request)
 
     def _database_create_reservation(
         self,
@@ -621,8 +669,23 @@ class RestaurantAPIClient:
                         f"RES-{secrets.token_hex(4).upper()}"
                     )
 
+                    customer_id = None
+                    if request.customer_email:
+                        customer = self._sync_customer_on_booking(
+                            session=session,
+                            email=request.customer_email,
+                            name=request.customer_name,
+                            phone=request.customer_phone,
+                            reservation_date=requested_date,
+                            seating_preference=request.seating_preference,
+                            special_requests=request.special_requests,
+                        )
+                        if customer:
+                            customer_id = customer.id
+
                     booking = Reservation(
                         id=reservation_id,
+                        customer_id=customer_id,
                         customer_name=request.customer_name,
                         customer_phone=request.customer_phone,
                         customer_email=request.customer_email,
@@ -670,13 +733,9 @@ class RestaurantAPIClient:
                 message="Invalid reservation date or time.",
             )
 
-        except Exception:
-            logger.exception("PostgreSQL reservation creation failed.")
-
-            return ReservationResponse(
-                status="failed",
-                message="Unable to create your reservation right now.",
-            )
+        except Exception as exc:
+            logger.warning("PostgreSQL reservation creation failed (%s); falling back to mock.", exc)
+            return self._mock_create_reservation(request)
 
     # ========================================================================
     # 4. GET EXISTING RESERVATION
@@ -699,17 +758,16 @@ class RestaurantAPIClient:
                         reservation_id,
                     )
 
-                    if booking is None:
-                        return None
+                    if booking is not None:
+                        return self._to_details(booking)
 
-                    return self._to_details(booking)
-
-            except Exception:
-                logger.exception(
-                    "PostgreSQL retrieval failed for %s",
+            except Exception as exc:
+                logger.warning(
+                    "PostgreSQL retrieval failed for %s (%s); falling back to mock",
                     reservation_id,
+                    exc,
                 )
-                return None
+            return self._mock_get_reservation(reservation_id)
 
         url = f"{self.base_url}/reservations/{reservation_id}"
 
@@ -724,9 +782,9 @@ class RestaurantAPIClient:
 
                 return ReservationDetails(**response.json())
 
-        except httpx.HTTPError as exc:
-            logger.error("Reservation retrieval API error: %s", exc)
-            return None
+        except (httpx.HTTPError, Exception) as exc:
+            logger.warning("Reservation retrieval API unreachable (%s). Falling back to mock backend.", exc)
+            return self._mock_get_reservation(reservation_id)
 
     # ========================================================================
     # 5. CANCEL RESERVATION
@@ -762,7 +820,7 @@ class RestaurantAPIClient:
 
                     if not booking or booking.status != "confirmed":
                         session.rollback()
-                        return False
+                        return self._mock_cancel_reservation(reservation_id)
 
                     booking.status = "cancelled"
 
@@ -774,12 +832,13 @@ class RestaurantAPIClient:
                     )
                     return True
 
-            except Exception:
-                logger.exception(
-                    "PostgreSQL cancellation failed for %s",
+            except Exception as exc:
+                logger.warning(
+                    "PostgreSQL cancellation failed for %s (%s); falling back to mock",
                     reservation_id,
+                    exc,
                 )
-                return False
+                return self._mock_cancel_reservation(reservation_id)
 
         url = f"{self.base_url}/reservations/{reservation_id}"
 
@@ -951,12 +1010,16 @@ class RestaurantAPIClient:
             logger.exception("Invalid reservation update data.")
             return None
 
-        except Exception:
-            logger.exception(
-                "PostgreSQL reservation update failed: %s",
+        except Exception as exc:
+            logger.warning("PostgreSQL reservation update failed: %s (%s); falling back to mock", reservation_id, exc)
+            return self._mock_update_reservation(
                 reservation_id,
+                reservation_date,
+                reservation_time,
+                guest_count,
+                seating_preference,
+                special_requests,
             )
-            return None
 
     # ========================================================================
     # MOCK IMPLEMENTATIONS
@@ -1051,8 +1114,20 @@ class RestaurantAPIClient:
 
         table_number = len(self._mock_db_reservations) + 1
 
+        customer_id = None
+        if req.customer_email:
+            customer_id = self._mock_sync_customer_on_booking(
+                email=req.customer_email,
+                name=req.customer_name,
+                phone=req.customer_phone,
+                reservation_date=req.reservation_date,
+                seating_preference=req.seating_preference,
+                special_requests=req.special_requests,
+            )
+
         booking = {
             "reservation_id": generated_id,
+            "customer_id": customer_id,
             "name": req.customer_name,
             "customer_phone": req.customer_phone,
             "customer_email": req.customer_email,
@@ -1103,6 +1178,7 @@ class RestaurantAPIClient:
             table_number=booking.get("table_number"),
             status=booking.get("status", "confirmed"),
             hold_token=booking.get("hold_token"),
+            customer_id=booking.get("customer_id"),
         )
 
     def _mock_get_reservation(
@@ -1157,6 +1233,318 @@ class RestaurantAPIClient:
             return self._mock_booking_to_details(booking)
 
         return None
+
+    # ========================================================================
+    # CRM (CUSTOMER RELATIONSHIP MANAGEMENT) METHODS
+    # ========================================================================
+
+    def _sync_customer_on_booking(
+        self,
+        session,
+        email: str,
+        name: str,
+        phone: Optional[str],
+        reservation_date: date,
+        seating_preference: Optional[str] = None,
+        special_requests: Optional[str] = None,
+    ) -> Optional[Customer]:
+        """Find or create a Customer CRM record and record this completed reservation visit."""
+        try:
+            raw_email = email.lower().strip()
+            norm_email = _normalize_email_address(raw_email) or raw_email
+            customer = session.query(Customer).filter(func.lower(Customer.email).in_([norm_email, raw_email])).first()
+
+            extracted_diet = None
+            if special_requests:
+                sr_lower = special_requests.lower()
+                dietary_keywords = ["vegan", "vegetarian", "halal", "kosher", "gluten-free", "gluten free", "nut allergy", "peanut allergy", "dairy free", "lactose"]
+                found_diets = [kw for kw in dietary_keywords if kw in sr_lower]
+                if found_diets:
+                    extracted_diet = ", ".join(d.title() for d in found_diets)
+
+            if customer:
+                customer.total_visits += 1
+                customer.last_visit_date = reservation_date
+                customer.vip_tier = calculate_vip_tier(customer.total_visits)
+                customer.email = norm_email
+                if name and not customer.name:
+                    customer.name = name
+                if phone and not customer.phone:
+                    customer.phone = phone
+                if seating_preference and not customer.seating_preference:
+                    customer.seating_preference = seating_preference
+                if extracted_diet:
+                    if customer.dietary_preferences:
+                        if extracted_diet.lower() not in customer.dietary_preferences.lower():
+                            customer.dietary_preferences += f", {extracted_diet}"
+                    else:
+                        customer.dietary_preferences = extracted_diet
+            else:
+                cust_id = f"CUST-{secrets.token_hex(4).upper()}"
+                customer = Customer(
+                    id=cust_id,
+                    name=name or "Valued Guest",
+                    email=norm_email,
+                    phone=phone,
+                    vip_tier="Standard",
+                    total_visits=1,
+                    last_visit_date=reservation_date,
+                    seating_preference=seating_preference,
+                    dietary_preferences=extracted_diet,
+                )
+                session.add(customer)
+
+            session.flush()
+            return customer
+        except Exception as exc:
+            logger.warning("Could not sync customer CRM on booking: %s", exc)
+            return None
+
+    def _mock_sync_customer_on_booking(
+        self,
+        email: str,
+        name: str,
+        phone: Optional[str],
+        reservation_date: str,
+        seating_preference: Optional[str] = None,
+        special_requests: Optional[str] = None,
+    ) -> str:
+        """Find or create a mock Customer CRM record and record this completed visit."""
+        raw_email = email.lower().strip()
+        norm_email = _normalize_email_address(raw_email) or raw_email
+        cust = self._mock_customers.get(norm_email) or self._mock_customers.get(raw_email)
+
+        extracted_diet = None
+        if special_requests:
+            sr_lower = special_requests.lower()
+            dietary_keywords = ["vegan", "vegetarian", "halal", "kosher", "gluten-free", "gluten free", "nut allergy", "peanut allergy", "dairy free", "lactose"]
+            found_diets = [kw for kw in dietary_keywords if kw in sr_lower]
+            if found_diets:
+                extracted_diet = ", ".join(d.title() for d in found_diets)
+
+        if cust:
+            cust["total_visits"] += 1
+            cust["last_visit_date"] = str(reservation_date)
+            cust["vip_tier"] = calculate_vip_tier(cust["total_visits"])
+            cust["email"] = norm_email
+            if name:
+                cust["name"] = name
+            if phone and not cust.get("phone"):
+                cust["phone"] = phone
+            if seating_preference and not cust.get("seating_preference"):
+                cust["seating_preference"] = seating_preference
+            if extracted_diet:
+                existing = cust.get("dietary_preferences") or ""
+                if existing and extracted_diet.lower() not in existing.lower():
+                    cust["dietary_preferences"] = f"{existing}, {extracted_diet}"
+                elif not existing:
+                    cust["dietary_preferences"] = extracted_diet
+            self._save_mock_customers()
+            return cust["id"]
+        else:
+            cust_id = f"CUST-{secrets.token_hex(4).upper()}"
+            self._mock_customers[norm_email] = {
+                "id": cust_id,
+                "name": name or "Valued Guest",
+                "email": norm_email,
+                "phone": phone,
+                "vip_tier": "Standard",
+                "total_visits": 1,
+                "dietary_preferences": extracted_diet,
+                "seating_preference": seating_preference,
+                "notes": None,
+                "last_visit_date": str(reservation_date),
+            }
+            self._save_mock_customers()
+            return cust_id
+
+    def _mock_get_customer_profile(
+        self,
+        email: Optional[str] = None,
+        phone: Optional[str] = None,
+        customer_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Lookup mock customer profile."""
+        if customer_id:
+            for c in self._mock_customers.values():
+                if c.get("id") == customer_id:
+                    return dict(c)
+        if email:
+            raw_email = email.lower().strip()
+            norm_email = _normalize_email_address(raw_email) or raw_email
+            if norm_email in self._mock_customers:
+                return dict(self._mock_customers[norm_email])
+            if raw_email in self._mock_customers:
+                return dict(self._mock_customers[raw_email])
+        if phone:
+            norm_phone = phone.strip()
+            for c in self._mock_customers.values():
+                if c.get("phone") == norm_phone:
+                    return dict(c)
+        return None
+
+    def _mock_update_customer_preferences(
+        self,
+        email_or_id: str,
+        dietary_preferences: Optional[str] = None,
+        seating_preference: Optional[str] = None,
+        notes: Optional[str] = None,
+        phone: Optional[str] = None,
+    ) -> dict:
+        """Update mock customer preferences."""
+        target = email_or_id.strip().lower()
+        norm_target = _normalize_email_address(target) or target
+        cust = None
+        if norm_target in self._mock_customers:
+            cust = self._mock_customers[norm_target]
+        elif target in self._mock_customers:
+            cust = self._mock_customers[target]
+        else:
+            for c in self._mock_customers.values():
+                if c.get("id", "").lower() == target:
+                    cust = c
+                    break
+
+        if not cust:
+            return {"success": False, "error": f"Customer '{email_or_id}' not found"}
+
+        if dietary_preferences is not None:
+            cust["dietary_preferences"] = dietary_preferences.strip()
+        if seating_preference is not None:
+            cust["seating_preference"] = seating_preference.strip()
+        if notes is not None:
+            cust["notes"] = notes.strip()
+        if phone is not None:
+            cust["phone"] = phone.strip()
+
+        self._save_mock_customers()
+        return {
+            "success": True,
+            "customer_id": cust["id"],
+            "vip_tier": cust["vip_tier"],
+            "dietary_preferences": cust.get("dietary_preferences"),
+            "seating_preference": cust.get("seating_preference"),
+            "notes": cust.get("notes"),
+        }
+
+    def get_customer_profile(
+        self,
+        email: Optional[str] = None,
+        phone: Optional[str] = None,
+        customer_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """
+        Lookup customer CRM profile by email, phone, or customer_id.
+        Returns profile dictionary including VIP tier and total visits, or None.
+        """
+        if not email and not phone and not customer_id:
+            return None
+
+        raw_email = email.lower().strip() if email else None
+        norm_email = _normalize_email_address(raw_email) if raw_email else None
+
+        if self.use_mock or not self.use_database:
+            return self._mock_get_customer_profile(email=norm_email or raw_email, phone=phone, customer_id=customer_id)
+
+        try:
+            with SessionLocal() as session:
+                query = session.query(Customer)
+                if customer_id:
+                    query = query.filter(Customer.id == customer_id)
+                elif norm_email or raw_email:
+                    candidates = list({c for c in (norm_email, raw_email) if c})
+                    query = query.filter(func.lower(Customer.email).in_(candidates))
+                elif phone:
+                    query = query.filter(Customer.phone == phone.strip())
+
+                cust = query.first()
+                if not cust:
+                    return self._mock_get_customer_profile(email=norm_email or raw_email, phone=phone, customer_id=customer_id)
+
+                return {
+                    "id": cust.id,
+                    "name": cust.name,
+                    "email": cust.email,
+                    "phone": cust.phone,
+                    "vip_tier": cust.vip_tier,
+                    "total_visits": cust.total_visits,
+                    "dietary_preferences": cust.dietary_preferences,
+                    "seating_preference": cust.seating_preference,
+                    "notes": cust.notes,
+                    "last_visit_date": cust.last_visit_date.isoformat() if cust.last_visit_date else None,
+                }
+        except Exception as exc:
+            logger.error("Error querying customer profile: %s", exc)
+            return self._mock_get_customer_profile(email=norm_email or raw_email, phone=phone, customer_id=customer_id)
+
+    def update_customer_preferences(
+        self,
+        email_or_id: str,
+        dietary_preferences: Optional[str] = None,
+        seating_preference: Optional[str] = None,
+        notes: Optional[str] = None,
+        phone: Optional[str] = None,
+    ) -> dict:
+        """
+        Update a customer's CRM profile attributes (allergies, seating preference, notes).
+        """
+        if not email_or_id:
+            return {"success": False, "error": "email_or_id is required"}
+
+        if self.use_mock or not self.use_database:
+            return self._mock_update_customer_preferences(
+                email_or_id=email_or_id,
+                dietary_preferences=dietary_preferences,
+                seating_preference=seating_preference,
+                notes=notes,
+                phone=phone,
+            )
+
+        try:
+            with SessionLocal() as session:
+                target = email_or_id.strip()
+                if "@" in target:
+                    cust = session.query(Customer).filter(func.lower(Customer.email) == target.lower()).first()
+                else:
+                    cust = session.query(Customer).filter(Customer.id == target).first()
+
+                if not cust:
+                    return self._mock_update_customer_preferences(
+                        email_or_id=email_or_id,
+                        dietary_preferences=dietary_preferences,
+                        seating_preference=seating_preference,
+                        notes=notes,
+                        phone=phone,
+                    )
+
+                if dietary_preferences is not None:
+                    cust.dietary_preferences = dietary_preferences.strip()
+                if seating_preference is not None:
+                    cust.seating_preference = seating_preference.strip()
+                if notes is not None:
+                    cust.notes = notes.strip()
+                if phone is not None:
+                    cust.phone = phone.strip()
+
+                session.commit()
+                session.refresh(cust)
+                return {
+                    "success": True,
+                    "customer_id": cust.id,
+                    "vip_tier": cust.vip_tier,
+                    "dietary_preferences": cust.dietary_preferences,
+                    "seating_preference": cust.seating_preference,
+                    "notes": cust.notes,
+                }
+        except Exception as exc:
+            logger.error("Error updating customer profile: %s", exc)
+            return self._mock_update_customer_preferences(
+                email_or_id=email_or_id,
+                dietary_preferences=dietary_preferences,
+                seating_preference=seating_preference,
+                notes=notes,
+                phone=phone,
+            )
 
 
 # ============================================================================

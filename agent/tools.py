@@ -40,6 +40,7 @@ class AgentTools:
         special_requests: Optional[str] = None,
         confirmed_by_customer: Optional[bool] = None,
         seating_preference: Optional[str] = None,
+        dietary_preferences: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Record or update customer information and reservation preferences.
@@ -57,7 +58,35 @@ class AgentTools:
             is_valid, msg = Guardrails.validate_email(email)
             if not is_valid:
                 return {"status": "error", "message": msg}
-            draft.update_field("customer_email", email.strip())
+
+            # Guard against hallucinated dummy domains like @example.com or @test.com during conversations
+            lowered_email = email.strip().lower()
+            if any(fake in lowered_email for fake in ("@example.com", "@test.com", "@sample.com")):
+                if self.session.history:
+                    user_mentions = " ".join(
+                        m["parts"][0]["text"] for m in self.session.history if m.get("role") == "user"
+                    ).lower()
+                    if not any(fake in user_mentions for fake in ("@example.com", "@test.com", "@sample.com")):
+                        return {
+                            "status": "error",
+                            "message": (
+                                "Do not autocomplete with @example.com or guess email domains. "
+                                "Ask the customer to provide their full email address with their real domain."
+                            ),
+                        }
+
+            normalized_email = Guardrails.normalize_email(email.strip())
+            draft.update_field("customer_email", normalized_email)
+
+            # Automatically sync CRM profile for returning guest when email is supplied
+            if (
+                not self.session.customer_profile
+                or (self.session.customer_profile.get("email", "").lower() != normalized_email.lower())
+            ):
+                try:
+                    self.get_customer_profile(email=normalized_email)
+                except Exception as crm_err:
+                    pass
 
         if date:
             is_valid, msg = Guardrails.validate_reservation_date(date)
@@ -94,6 +123,9 @@ class AgentTools:
                 }
 
             draft.update_field("seating_preference", seating_preference)
+
+        if dietary_preferences:
+            draft.update_field("dietary_preferences", dietary_preferences.strip())
 
         # Check whether we are ready for customer confirmation.
         if (
@@ -659,3 +691,142 @@ class AgentTools:
             return result
         except Exception as exc:
             return {"success": False, "error": str(exc)}
+
+    def get_customer_profile(
+        self,
+        email: Optional[str] = None,
+        phone: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Lookup customer CRM loyalty profile by email or phone.
+        Updates session state and auto-populates known preferences.
+        """
+        raw_email = email.strip() if email else (self.session.draft.customer_email or None)
+        search_email = Guardrails.normalize_email(raw_email) if raw_email else None
+        search_phone = phone.strip() if phone else (self.session.draft.customer_phone or None)
+
+        if not search_email and not search_phone:
+            return {"found": False, "message": "Email or phone number is required to look up customer profile."}
+
+        profile_data = None
+        try:
+            mcp_res = call_mcp_tool(
+                "get_customer_profile",
+                {"email": search_email, "phone": search_phone},
+            )
+            if isinstance(mcp_res, dict) and mcp_res.get("found"):
+                profile_data = mcp_res.get("profile")
+        except Exception:
+            pass
+
+        # Fallback to direct restaurant_api if MCP tool is offline/failed
+        if not profile_data:
+            try:
+                profile_obj = restaurant_api.get_customer_profile(email=search_email, phone=search_phone)
+                if profile_obj:
+                    profile_data = profile_obj.model_dump() if hasattr(profile_obj, "model_dump") else profile_obj
+            except Exception:
+                pass
+
+        if profile_data:
+            self.session.customer_profile = profile_data
+            self.session.is_returning_customer = True
+
+            draft = self.session.draft
+            if not draft.customer_name and profile_data.get("name"):
+                draft.customer_name = profile_data["name"]
+            if not draft.customer_email and profile_data.get("email"):
+                draft.customer_email = profile_data["email"]
+            if not draft.customer_phone and profile_data.get("phone"):
+                draft.customer_phone = profile_data["phone"]
+            if (not draft.seating_preference or draft.seating_preference == "any") and profile_data.get("seating_preference"):
+                draft.seating_preference = profile_data["seating_preference"]
+            if not draft.dietary_preferences and profile_data.get("dietary_preferences"):
+                draft.dietary_preferences = profile_data["dietary_preferences"]
+            draft.vip_tier = profile_data.get("vip_tier", "Standard")
+            draft.customer_id = profile_data.get("id")
+
+            return {
+                "found": True,
+                "message": f"Welcome back, {profile_data.get('name')}! Recognized as {profile_data.get('vip_tier', 'Standard')} loyalty guest with {profile_data.get('total_visits', 1)} total visits.",
+                "profile": profile_data,
+            }
+
+        return {
+            "found": False,
+            "message": "Customer profile not found. Guest is recognized as a new customer.",
+        }
+
+    def update_customer_preferences(
+        self,
+        dietary_preferences: Optional[str] = None,
+        seating_preference: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Update the guest's CRM preferences (dietary, seating, notes).
+        """
+        customer_id = (
+            (self.session.customer_profile and self.session.customer_profile.get("id"))
+            or self.session.draft.customer_id
+        )
+        email = self.session.draft.customer_email or (self.session.customer_profile and self.session.customer_profile.get("email"))
+        phone = self.session.draft.customer_phone or (self.session.customer_profile and self.session.customer_profile.get("phone"))
+
+        if not customer_id and not email and not phone:
+            return {"success": False, "message": "Cannot update preferences: no customer identification (email/phone/id) found."}
+
+        # Update draft
+        if dietary_preferences:
+            self.session.draft.dietary_preferences = dietary_preferences.strip()
+        if seating_preference:
+            self.session.draft.seating_preference = seating_preference.strip()
+
+        updated_profile = None
+        try:
+            mcp_res = call_mcp_tool(
+                "update_customer_preferences",
+                {
+                    "customer_id": customer_id,
+                    "email": email,
+                    "phone": phone,
+                    "dietary_preferences": dietary_preferences,
+                    "seating_preference": seating_preference,
+                    "notes": notes,
+                },
+            )
+            if isinstance(mcp_res, dict) and mcp_res.get("success"):
+                updated_profile = mcp_res.get("profile")
+        except Exception:
+            pass
+
+        if not updated_profile:
+            try:
+                target_key = customer_id or email or phone
+                if target_key:
+                    prof_obj = restaurant_api.update_customer_preferences(
+                        email_or_id=target_key,
+                        dietary_preferences=dietary_preferences,
+                        seating_preference=seating_preference,
+                        notes=notes,
+                        phone=phone,
+                    )
+                    if isinstance(prof_obj, dict) and prof_obj.get("success"):
+                        # Refresh full profile
+                        refreshed = restaurant_api.get_customer_profile(email=email, phone=phone, customer_id=customer_id)
+                        updated_profile = refreshed or prof_obj
+            except Exception:
+                pass
+
+        if updated_profile:
+            self.session.customer_profile = updated_profile
+            return {
+                "success": True,
+                "message": "Customer CRM preferences updated successfully.",
+                "profile": updated_profile,
+            }
+
+        return {
+            "success": False,
+            "message": "Customer preferences recorded in session, but could not be saved to CRM store.",
+        }

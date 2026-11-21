@@ -43,6 +43,9 @@ class ReservationDraft(BaseModel):
     hold_token: Optional[str] = None
     seating_preference: str = "any"
     confirmed_by_customer: bool = False
+    customer_id: Optional[str] = None
+    vip_tier: Optional[str] = None
+    dietary_preferences: Optional[str] = None
 
     def is_ready_for_availability_check(self) -> bool:
         """Determines if enough information exists to query table availability."""
@@ -112,6 +115,9 @@ class SessionMemory:
         self.google_calendar_authorized: bool = False
         self.authorized_google_email: Optional[str] = None
         self.last_confirmed_calendar_event_id: Optional[str] = None
+        self.customer_profile: Optional[Dict[str, Any]] = None
+        self.is_returning_customer: bool = False
+        self.returning_guest_greeted: bool = False
         self.created_at: datetime = datetime.now(timezone.utc)
         self.updated_at: datetime = datetime.now(timezone.utc)
 
@@ -148,6 +154,9 @@ class SessionMemory:
         self.google_calendar_authorized = False
         self.authorized_google_email = None
         self.last_confirmed_calendar_event_id = None
+        self.customer_profile = None
+        self.is_returning_customer = False
+        self.returning_guest_greeted = False
         self.updated_at = datetime.now(timezone.utc)
 
 

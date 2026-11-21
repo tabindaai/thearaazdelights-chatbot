@@ -1,8 +1,8 @@
-# The Araaz Delights – AI-Powered Restaurant Reservation Chatbot with Google Calendar MCP Integration
+# The Araaz Delights – AI-Powered Restaurant Reservation Chatbot with Customer Relationship Management (CRM) & Google Calendar MCP Integration
 
-The Araaz Delights is an AI-powered restaurant reservation concierge designed to handle table bookings through natural, human-like conversations. Powered by Google's Gemini model and an AI assistant named **Aria**, the system guides guests through checking table availability, selecting preferences, confirming bookings, and automatically synchronizing reservations with their personal **Google Calendar** with an automated **3-hour reminder**.
+The Araaz Delights is an AI-powered restaurant reservation concierge designed to deliver personalized, 5-star hospitality through natural, human-like conversations. Powered by Google's Gemini model and an AI assistant named **Aria**, the system guides guests through checking table availability, selecting preferences, confirming bookings, recognizing returning guests with an integrated **Customer Relationship Management (CRM)** loyalty engine, and automatically synchronizing reservations with their personal **Google Calendar** with an automated **3-hour reminder**.
 
-The architecture uses the **Model Context Protocol (MCP)** to connect conversational AI to backend tools through a **single unified MCP client** communicating over Streamable HTTP with two independent MCP servers: the **Restaurant MCP Server** (for table bookings) and the **Google Calendar MCP Server** (for calendar event management).
+The architecture uses the **Model Context Protocol (MCP)** to connect conversational AI to backend tools through a **single unified MCP client** communicating over Streamable HTTP with two independent MCP servers: the **Restaurant MCP Server** (for table bookings and CRM customer profiles) and the **Google Calendar MCP Server** (for calendar event management).
 
 ---
 
@@ -16,6 +16,7 @@ The architecture uses the **Model Context Protocol (MCP)** to connect conversati
 - [Customer Email Collection & Validation](#customer-email-collection--validation)
 - [Google OAuth 2.0 Authorization Flow](#google-oauth-20-authorization-flow)
 - [Automatic Calendar Synchronization](#automatic-calendar-synchronization)
+- [Customer Relationship Management (CRM) & VIP Loyalty Engine](#customer-relationship-management-crm--vip-loyalty-engine)
 - [3-Hour (180-Minute) Reminder Configuration](#3-hour-180-minute-reminder-configuration)
 - [Reservation Update & Cancellation Synchronization](#reservation-update--cancellation-synchronization)
 - [Database Schema & Migrations](#database-schema--migrations)
@@ -31,6 +32,7 @@ The architecture uses the **Model Context Protocol (MCP)** to connect conversati
 
 - **Natural AI Concierge (Aria):** Understands greetings (*hello, hi, namaste*), relative dates (*tomorrow, next Friday*), natural times (*7 PM, 19:30*), polite acknowledgments, and conversation closings.
 - **Mandatory Email Collection:** Collects customer name, email address, reservation date, time, and guest count naturally without repetitive questioning. Phone number is strictly optional.
+- **Customer Relationship Management (CRM) & Loyalty Engine:** Recognizes returning guests by email or phone, automatically calculates and promotes VIP loyalty tiers (Standard, Silver, Gold, VIP Platinum), tracks visit counts, and recalls past dietary restrictions/allergies and seating preferences.
 - **Table Availability Checking:** Verifies real-time table capacity and returns alternative slots when a preferred time is booked out.
 - **Two Independent MCP Servers:** Separates restaurant database operations (Port `8001`) from Google Calendar operations (Port `8002`).
 - **Single Unified MCP Client (`agent/mcp_client.py`):** A single persistent bridge managing concurrent connections to both MCP servers with automatic tool routing and fault isolation.
@@ -55,7 +57,7 @@ The architecture uses the **Model Context Protocol (MCP)** to connect conversati
 | **Protocol Architecture** | Model Context Protocol (MCP) | Standardized client-server tool execution protocol |
 | **MCP Framework** | FastMCP (`mcp` Python SDK) | Lightweight Streamable HTTP servers |
 | **Calendar API** | Google Calendar API v3 | `google-api-python-client`, `google-auth-oauthlib` |
-| **Database (Reservations)** | PostgreSQL + SQLAlchemy 2.0 | Persistent reservation storage |
+| **Database (Reservations & CRM)** | PostgreSQL + SQLAlchemy 2.0 | Persistent reservation storage, customer profiles, and VIP tiers |
 | **Database (OAuth Tokens)** | SQLite (`oauth_tokens.db`) | Dedicated server-side token store with thread locks |
 | **Validation & Schemas** | Pydantic v2 | Schema enforcement and runtime data validation |
 | **Testing** | Pytest + Pytest-Asyncio | Unit and integration test suite |
@@ -70,18 +72,18 @@ The application implements a clean separation of concerns: conversational orches
 
 ```mermaid
 flowchart TD
-    User([Customer / Guest]) <--> UI[Streamlit Frontend\n:8501]
-    UI <--> API[FastAPI Backend\nmain.py :8000]
-    API <--> Agent[Gemini AI Concierge\nagent/chatbot.py]
+    User([Customer / Guest]) <--> UI[Streamlit Frontend\n:8501\n(Chat UI, VIP Badges, OAuth)]
+    UI <--> API[FastAPI Backend\nmain.py :8000\n(/chat, /health, /session, /auth)]
+    API <--> Agent[Gemini AI Concierge\nagent/chatbot.py\n(Aria Orchestrator)]
     Agent <--> Tools[Agent Tools Bridge\nagent/tools.py]
     
-    Tools <--> MCPClient[Unified MCP Client\nagent/mcp_client.py]
+    Tools <--> MCPClient[Unified MCP Client\nagent/mcp_client.py\n(Persistent Background Worker)]
     
-    MCPClient <-- Streamable HTTP :8001 --> RestMCP[Restaurant MCP Server\nmcp_server.py :8001]
-    MCPClient <-- Streamable HTTP :8002 --> CalMCP[Google Calendar MCP Server\ncalendar_mcp_server.py :8002]
+    MCPClient <-- Streamable HTTP :8001 --> RestMCP[Restaurant MCP Server\nmcp_server.py :8001\n(Table Bookings & CRM Loyalty Tools)]
+    MCPClient <-- Streamable HTTP :8002 --> CalMCP[Google Calendar MCP Server\ncalendar_mcp_server.py :8002\n(Events & 3-Hour Reminders)]
     
-    RestMCP <--> RestAPI[Restaurant API Service\nservices/restaurant_api.py]
-    RestAPI <--> DB[(PostgreSQL Database\nreservations table)]
+    RestMCP <--> RestAPI[Restaurant API Service\nservices/restaurant_api.py\n(Capacity & CRM Engine)]
+    RestAPI <--> DB[(PostgreSQL Database :5432\nreservations & customers tables\n+ mock_crm_customers.json disk fallback)]
     
     CalMCP <--> CalService[Calendar Service\nservices/calendar_service.py]
     CalService <--> OAuthStore[(SQLite Store\noauth_tokens.db)]
@@ -91,12 +93,14 @@ flowchart TD
 ### Flow Summary
 
 1. **Guest interacts with Streamlit:** Messages are sent via HTTP POST `/chat` to FastAPI.
-2. **FastAPI & Agent:** FastAPI routes messages into `RestaurantChatbotAgent`, evaluating input guardrails, dynamic system prompts, and conversation history.
-3. **Gemini Tool Calling:** Gemini decides which tools to invoke (`check_table_availability`, `update_reservation_details`, `create_reservation`, etc.).
-4. **AgentTools Execution:** `AgentTools` passes tool calls to `call_mcp_tool()`.
-5. **Unified MCP Client Routing:** `agent/mcp_client.py` determines whether the tool belongs to the restaurant domain or calendar domain, routing it to Port `8001` or Port `8002`.
-6. **Backend Execution:**
-   - Restaurant tools execute against PostgreSQL/mock database via `services/restaurant_api.py`.
+2. **FastAPI & Agent:** FastAPI routes messages into `RestaurantChatbotAgent`, evaluating input guardrails, incomplete email interception, dynamic system prompts, and conversation history.
+3. **CRM Profile Auto-Lookup:** When an email address is provided (or extracted from natural phrasing), Aria automatically normalizes any domain typos and queries the guest's CRM profile via `get_customer_profile`.
+4. **Returning Guest Recognition:** Returning guests are greeted warmly by name, explicitly acknowledging their visit count (e.g. 2nd or 3rd visit), loyalty tier, and recalled dining preferences without re-asking questions.
+5. **Gemini Tool Calling:** Gemini decides which tools to invoke (`check_table_availability`, `update_reservation_details`, `create_reservation`, `update_customer_preferences`, etc.).
+6. **AgentTools Execution:** `AgentTools` passes tool calls to `call_mcp_tool()`.
+7. **Unified MCP Client Routing:** `agent/mcp_client.py` determines whether the tool belongs to the restaurant/CRM domain or calendar domain, routing it to Port `8001` or Port `8002`.
+8. **Backend Execution:**
+   - Restaurant and CRM tools execute against PostgreSQL (or persistent disk mock fallback) via `services/restaurant_api.py`.
    - Calendar tools execute against Google Calendar API using stored OAuth tokens via `services/calendar_service.py`.
 
 ---
@@ -108,41 +112,45 @@ restaurant_ai_chatbot/
 │
 ├── agent/
 │   ├── __init__.py
-│   ├── chatbot.py              # Gemini conversational orchestrator & tool execution loop
-│   ├── guardrails.py           # Input sanitization, email validation, and topic filters
-│   ├── mcp_client.py           # Unified persistent MCP client connecting to both servers
-│   ├── memory.py               # Session memory, FSM states, and ReservationDraft
-│   ├── prompts.py              # Dynamic system prompt builder with runtime context
-│   └── tools.py                # AgentTools binding session logic to MCP calls
+│   ├── chatbot.py              # Gemini orchestrator, AFC, CRM profile auto-lookup, returning guest greetings
+│   ├── guardrails.py           # Input validation, anti-injection, incomplete email guard, domain typo normalizer
+│   ├── mcp_client.py           # Unified persistent MCP client connecting to both servers (8001 & 8002)
+│   ├── memory.py               # Session memory, FSM states, CRM customer profile, and ReservationDraft
+│   ├── prompts.py              # Dynamic system prompt builder with VIP tier & preference runtime context
+│   └── tools.py                # AgentTools binding session logic to MCP booking & CRM tools
 │
 ├── frontend/
-│   └── app.py                  # Streamlit chat interface with Google Calendar sidebar controls
+│   └── app.py                  # Streamlit chat UI with CRM VIP guest loyalty badge & Google Calendar controls
 │
 ├── schemas/
 │   ├── __init__.py
 │   ├── chat.py                 # Pydantic models for chat requests and responses
-│   └── reservation.py          # Data validation models for availability and bookings
+│   ├── customer.py             # Pydantic models for CRM customer profile, VIP tiers & preference updates
+│   └── reservation.py          # Data validation models for availability, holds, and bookings
 │
 ├── services/
 │   ├── __init__.py
 │   ├── calendar_service.py     # Google Calendar API v3 client (CRUD & 3-hour reminder)
-│   ├── db.py                   # SQLAlchemy engine, session maker, and connection logic
-│   ├── models.py               # SQLAlchemy models (Reservation with calendar_event_id)
-│   ├── oauth_store.py          # SQLite token store for Google OAuth tokens
-│   └── restaurant_api.py       # Restaurant backend service (PostgreSQL, mock, HTTP)
+│   ├── db.py                   # SQLAlchemy engine, session maker, connection check, and table migrations
+│   ├── models.py               # SQLAlchemy models (Customer CRM table and Reservation with customer_id & calendar_event_id)
+│   ├── oauth_store.py          # SQLite token store for Google OAuth credentials (oauth_tokens.db)
+│   └── restaurant_api.py       # Restaurant backend service (PostgreSQL, persistent mock disk fallback, HTTP)
 │
 ├── tests/
 │   ├── __init__.py
 │   ├── test_availability.py    # Availability and capacity limit unit tests
-│   ├── test_guardrails.py      # Input, email, and confirmation gate guardrail tests
+│   ├── test_crm.py             # VIP tier progression, profile synchronization, and typo-resilience tests
+│   ├── test_guardrails.py      # Input, incomplete email detection, domain normalizer, and confirmation gate tests
 │   ├── test_memory.py          # Multi-turn memory and draft accumulation tests
 │   └── test_reservation.py     # End-to-end booking scenarios
 │
 ├── calendar_mcp_server.py      # FastMCP Google Calendar server (port 8002)
-├── create_tables.py            # PostgreSQL database table initialization script
-├── main.py                     # FastAPI backend application with OAuth routes
-├── mcp_server.py               # FastMCP Restaurant server (port 8001)
+├── create_tables.py            # PostgreSQL database table initialization script (reservations & customers)
+├── main.py                     # FastAPI backend application with OAuth routes and session CRM inspection
+├── mcp_server.py               # FastMCP Restaurant server (port 8001) with booking & CRM loyalty tools
+├── mock_crm_customers.json     # Persistent disk backup for mock CRM customer profiles
 ├── test_mcp_client.py          # Standalone MCP client testing demo script
+├── verify_crm.py               # Standalone CRM lifecycle verification script (first visit, returning recognition, tier upgrade)
 ├── verify_get_reservation.py   # MCP restart persistence verification script
 ├── requirements.txt            # Python package dependencies
 ├── .env.example                # Safe environment variable configuration template
@@ -194,13 +202,15 @@ Aria collects the customer's email address as a mandatory detail before confirmi
 5. **Number of Guests** (`1` to `20`)
 
 *Phone number is strictly optional.*
-
 ### Validation & Behavior
 - **Regex Format Validation:** Evaluated by `Guardrails.validate_email()`:
   ```regex
   ^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$
   ```
-- **Context-Aware Topic Guard:** Email addresses provided naturally (e.g. `arun.kumar@gmail.com` or `my email is test@domain.com`) are recognized as valid detail answers and are never blocked as off-topic.
+- **Incomplete Email Detection:** Evaluated deterministically by `Guardrails.detect_incomplete_email()`. If a customer supplies only a username or partial handle (e.g., `zara987 is my email adress` or simply `zara987`), Aria immediately halts before the LLM and politely requests the full address including `@` and the domain.
+- **Anti-Hallucination Email Gate:** Aria's tools actively block synthetic domains (`@example.com`, `@test.com`, `@sample.com`) unless literally typed by the user, ensuring the agent never invents fake domains.
+- **Automatic Domain Typo Normalization:** `Guardrails.normalize_email()` automatically maps common accidental user typos (e.g. `gamil.com` -> `gmail.com`, `yaho.com` -> `yahoo.com`, `hotmial.com` -> `hotmail.com`) ensuring returning guests are always seamlessly linked to their existing profile across visits and browser reloads.
+- **Context-Aware Topic Guard:** Email addresses provided naturally (e.g. `arun.kumar@gmail.com` or `my email is test@gmail.com`) are recognized as valid detail answers and are never blocked as off-topic.
 - **Correction Support:** Customers can update or correct their email address at any point before confirmation.
 - **Privacy:** Email addresses are never exposed in system error logs or leaked to third-party endpoints.
 
@@ -266,6 +276,57 @@ Once the restaurant backend confirms a table booking, the application triggers c
 
 ---
 
+## Customer Relationship Management (CRM) & VIP Loyalty Engine
+
+The Araaz Delights features an integrated CRM system designed to deliver personalized, 5-star hospitality. Returning guests are automatically recognized by email address or phone number, with their loyalty tier, visit counts, seating preferences, and dietary restrictions persisted across sessions.
+
+### 1. Loyalty Tiers & Automated Progression
+Loyalty tiers are dynamically calculated based on the cumulative number of confirmed reservation visits:
+
+| Tier | Required Completed Visits | Dining Perks & Recognition |
+|---|---|---|
+| 🥉 **Standard** | 1 - 2 visits | Welcome message, baseline profile memory |
+| 🥈 **Silver** | 3 - 5 visits | Priority seating consideration, preference recall |
+| 🥇 **Gold** | 6 - 9 visits | VIP welcome, complimentary chef amuse-bouche, favorite table priority |
+| 💎 **VIP Platinum** | 10+ visits | Elite concierge greeting, guaranteed best seating (indoor window/garden booth), personalized chef tasting accommodations |
+
+```python
+def calculate_vip_tier(total_visits: int) -> str:
+    if total_visits >= 10:
+        return "VIP Platinum"
+    elif total_visits >= 6:
+        return "Gold"
+    elif total_visits >= 3:
+        return "Silver"
+    return "Standard"
+```
+
+### 2. Returning Guest Recognition & 2nd-Visit Greeting
+When a guest enters their email or phone number:
+- **Instant CRM Auto-Lookup:** Aria triggers `get_customer_profile` behind the scenes.
+- **Explicit Visit Count Greeting:** Aria warmly welcomes the guest back by name, explicitly acknowledging their upcoming visit count (e.g., *"Welcome back, Priya! Wonderful to see you again at The Araaz Delights for your 2nd visit."*).
+- **Preference Memory & Automatic Recall:** Known dietary restrictions/allergies (e.g., *Nut Allergy, Vegan, Gluten-Free*) and seating preferences (*Window booth, Outdoor*) are injected into Aria's runtime context without forcing the guest to re-enter them.
+- **Dynamic Updates:** If a customer mentions new allergies or preferences, Aria calls `update_customer_preferences` to persist them immediately.
+
+### 3. CRM Robustness & Resilience Features
+- **Incomplete Email Interception (`detect_incomplete_email`):** If a customer types an incomplete email or username (e.g., `zara987 is my email adress` or simply `zara987`), Aria halts before the model and politely asks for the full email address with domain.
+- **Anti-Hallucination Email Gate:** Aria's tools actively block synthetic dummy domains (`@example.com`, `@test.com`, `@sample.com`) unless explicitly typed by the guest.
+- **Email Domain Typo Normalization (`normalize_email`):** Automatically maps common accidental typos (`@gamil.com` -> `@gmail.com`, `@yaho.com` -> `@yahoo.com`, `@hotmial.com` -> `@hotmail.com`) so returning guests are never split into separate profiles due to typos.
+- **Dual-Layer Persistence:**
+  - **Primary:** PostgreSQL relational `customers` table with `customer_id` foreign key mapped to `reservations`.
+  - **Persistent Disk Fallback (`mock_crm_customers.json`):** When running in mock/offline mode without PostgreSQL, all customer profiles, visit histories, and preferences are automatically saved to `mock_crm_customers.json`, surviving `uvicorn --reload` restarts and browser page reloads.
+
+### 4. CRM Tools on Restaurant MCP Server (Port 8001)
+- `get_customer_profile(email, phone)`: Looks up guest loyalty tier, total visits, and saved dining preferences.
+- `update_customer_preferences(customer_id, email, phone, dietary_preferences, seating_preference, notes)`: Updates saved guest preferences in PostgreSQL or mock disk storage.
+
+### 5. Streamlit Frontend CRM Integration
+The customer-facing web UI (`frontend/app.py`) dynamically reads the guest's CRM profile from the session endpoint (`/session/{session_id}`) and renders:
+- An elegant **VIP Loyalty Badge** in the sidebar (🥉 Standard, 🥈 Silver, 🥇 Gold, 💎 VIP Platinum).
+- A **Returning Guest Profile Card** displaying total confirmed visits, known dietary restrictions, and preferred seating.
+
+---
+
 ## 3-Hour (180-Minute) Reminder Configuration
 
 ### Reminder Setting
@@ -310,7 +371,31 @@ If a calendar update or deletion fails (e.g. Google API rate limits or network i
 
 ## Database Schema & Migrations
 
-### 1. PostgreSQL `reservations` Table
+### 1. PostgreSQL `customers` Table (CRM)
+
+The `customers` table schema in `services/models.py`:
+
+```python
+class Customer(Base):
+    __tablename__ = "customers"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(150), nullable=False)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    phone: Mapped[str | None] = mapped_column(String(30), index=True, nullable=True)
+    vip_tier: Mapped[str] = mapped_column(String(30), nullable=False, default="Standard")
+    total_visits: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    dietary_preferences: Mapped[str | None] = mapped_column(Text, nullable=True)
+    seating_preference: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_visit_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), onupdate=func.now())
+
+    reservations: Mapped[list["Reservation"]] = relationship("Reservation", back_populates="customer")
+```
+
+### 2. PostgreSQL `reservations` Table
 
 The `reservations` table schema in `services/models.py`:
 
@@ -319,6 +404,7 @@ class Reservation(Base):
     __tablename__ = "reservations"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    customer_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("customers.id"), nullable=True)
     customer_name: Mapped[str] = mapped_column(String(150), nullable=False)
     customer_phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
     customer_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -334,16 +420,18 @@ class Reservation(Base):
     calendar_event_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), onupdate=func.now())
+
+    customer: Mapped["Customer"] = relationship("Customer", back_populates="reservations")
 ```
 
-#### Migration for Existing Databases
-If updating an existing PostgreSQL database instance, execute the following SQL:
+#### Running Database Migrations
+Execute `create_tables.py` to create or update all tables and foreign key constraints:
 
-```sql
-ALTER TABLE reservations ADD COLUMN IF NOT EXISTS calendar_event_id VARCHAR(255);
+```powershell
+python create_tables.py
 ```
 
-### 2. SQLite OAuth Token Store (`oauth_tokens.db`)
+### 3. SQLite OAuth Token Store (`oauth_tokens.db`)
 
 OAuth credentials are kept in a separate, local SQLite database (`oauth_tokens.db`) managed by `services/oauth_store.py`. This ensures token storage remains independent from PostgreSQL and functions identically in mock backend mode.
 
@@ -500,10 +588,23 @@ streamlit run frontend/app.py
 
 ## Testing & Verification
 
-### Run Automated Unit Tests
+The test suite covers 43 automated tests across table availability, CRM loyalty tiers, customer memory, conversation guardrails, and full reservation workflows.
+
+### Run Full Test Suite
 
 ```powershell
 .venv\Scripts\python.exe -m pytest
+```
+
+### Run Dedicated CRM Tests
+```powershell
+.venv\Scripts\python.exe -m pytest tests/test_crm.py -v
+```
+
+### Interactive CRM Verification Script
+To verify the full CRM and Loyalty Tier lifecycle end-to-end (clean state, first-time booking, returning guest recognition, preference updates, and tier progression):
+```powershell
+python verify_crm.py
 ```
 
 ### Standalone MCP Communication Test

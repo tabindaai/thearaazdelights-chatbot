@@ -114,6 +114,8 @@ async def get_session_info(session_id: str):
         "draft": session.draft.model_dump(),
         "missing_fields": session.draft.missing_fields_for_booking(),
         "history_count": len(session.history),
+        "customer_profile": session.customer_profile,
+        "is_returning_customer": session.is_returning_customer,
     }
 
 
